@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import logging
 import os
 import unittest
 
@@ -129,8 +130,10 @@ class TrainingTest(test.TestCase):
           {
               'input_a': input_a_np,
               'input_b': input_b_np
-          }, {'dense': output_d_np,
-              'dropout': output_e_np},
+          }, {
+              'dense': output_d_np,
+              'dropout': output_e_np
+          },
           epochs=1,
           batch_size=5,
           verbose=0)
@@ -138,8 +141,10 @@ class TrainingTest(test.TestCase):
           {
               'input_a': input_a_np,
               'input_b': input_b_np
-          }, {'dense': output_d_np,
-              'dropout': output_e_np},
+          }, {
+              'dense': output_d_np,
+              'dropout': output_e_np
+          },
           epochs=1,
           batch_size=5,
           verbose=1)
@@ -147,8 +152,10 @@ class TrainingTest(test.TestCase):
           {
               'input_a': input_a_np,
               'input_b': input_b_np
-          }, {'dense': output_d_np,
-              'dropout': output_e_np},
+          }, {
+              'dense': output_d_np,
+              'dropout': output_e_np
+          },
           validation_data=({
               'input_a': input_a_np,
               'input_b': input_b_np
@@ -162,8 +169,10 @@ class TrainingTest(test.TestCase):
       model.train_on_batch({
           'input_a': input_a_np,
           'input_b': input_b_np
-      }, {'dense': output_d_np,
-          'dropout': output_e_np})
+      }, {
+          'dense': output_d_np,
+          'dropout': output_e_np
+      })
 
       # Test with lists for loss, metrics
       loss = ['mae', 'mse']
@@ -285,16 +294,20 @@ class TrainingTest(test.TestCase):
           {
               'input_a': input_a_np,
               'input_b': input_b_np
-          }, {'dense': output_d_np,
-              'dropout': output_e_np},
+          }, {
+              'dense': output_d_np,
+              'dropout': output_e_np
+          },
           batch_size=5,
           verbose=0)
       model.evaluate(
           {
               'input_a': input_a_np,
               'input_b': input_b_np
-          }, {'dense': output_d_np,
-              'dropout': output_e_np},
+          }, {
+              'dense': output_d_np,
+              'dropout': output_e_np
+          },
           batch_size=5,
           verbose=1)
 
@@ -349,9 +362,11 @@ class TrainingTest(test.TestCase):
 
     with self.test_session():
       test_inputs = [
-          scipy_sparse.random(6, 3, density=0.25).tocsr() for _ in range(2)]
+          scipy_sparse.random(6, 3, density=0.25).tocsr() for _ in range(2)
+      ]
       test_outputs = [
-          scipy_sparse.random(6, i, density=0.25).tocsr() for i in range(3, 5)]
+          scipy_sparse.random(6, i, density=0.25).tocsr() for i in range(3, 5)
+      ]
       in1 = keras.layers.Input(shape=(3,))
       in2 = keras.layers.Input(shape=(3,))
       out1 = keras.layers.Dropout(0.5, name='dropout')(in1)
@@ -400,6 +415,28 @@ class TrainingTest(test.TestCase):
       model.train_on_batch(val_a, val_out)
       x2 = model.predict(val_a)
       self.assertAllClose(x1, x2, atol=1e-7)
+
+  def test_compile_warning_for_loss_missing_output(self):
+    with self.test_session():
+      inp = keras.layers.Input(shape=(16,), name='input_a')
+      out_1 = keras.layers.Dense(8, name='dense_1')(inp)
+      out_2 = keras.layers.Dense(3, activation='softmax', name='dense_2')(out_1)
+      model = keras.models.Model(inputs=[inp], outputs=[out_1, out_2])
+
+      with test.mock.patch.object(logging, 'warning') as mock_log:
+        model.compile(
+            loss={
+                'dense_2': 'categorical_crossentropy',
+            },
+            optimizer='rmsprop',
+            metrics={
+                'dense_2': 'categorical_accuracy',
+                'dense_1': 'categorical_accuracy',
+            })
+        msg = ('Output "dense_1" missing from loss dictionary. We assume this '
+               'was done on purpose. The fit and evaluate APIs will not be '
+               'expecting any data to be passed to "dense_1".')
+        self.assertRegexpMatches(str(mock_log.call_args), msg)
 
 
 class LossWeightingTest(test.TestCase):
@@ -1682,7 +1719,7 @@ class TestTrainingWithDataTensors(test.TestCase):
       model.train_on_batch([input_a_np, input_b_np],
                            [output_a_np, output_b_np])
 
-  @tf_test_util.run_in_graph_and_eager_modes()
+  @tf_test_util.run_in_graph_and_eager_modes
   def test_metric_names_are_identical_in_graph_and_eager(self):
     a = keras.layers.Input(shape=(3,), name='input_a')
     b = keras.layers.Input(shape=(3,), name='input_b')
@@ -1709,7 +1746,7 @@ class TestTrainingWithDataTensors(test.TestCase):
 
 class TestTrainingWithDatasetIterators(test.TestCase):
 
-  @tf_test_util.run_in_graph_and_eager_modes()
+  @tf_test_util.run_in_graph_and_eager_modes
   def test_training_and_eval_methods_on_iterators_single_io(self):
     with self.test_session():
       x = keras.layers.Input(shape=(3,), name='input')
@@ -1721,8 +1758,8 @@ class TestTrainingWithDatasetIterators(test.TestCase):
       metrics = ['mae']
       model.compile(optimizer, loss, metrics=metrics)
 
-      inputs = np.zeros((10, 3), dtype=np.float32)
-      targets = np.zeros((10, 4), dtype=np.float32)
+      inputs = np.zeros((10, 3))
+      targets = np.zeros((10, 4))
       dataset = dataset_ops.Dataset.from_tensor_slices((inputs, targets))
       dataset = dataset.repeat(100)
       dataset = dataset.batch(10)
@@ -1742,7 +1779,7 @@ class TestTrainingWithDatasetIterators(test.TestCase):
       # Test with validation split
       with self.assertRaisesRegexp(
           ValueError, '`validation_split` argument is not supported '
-          'when input `x` is a dataset iterator'):
+          'when input `x` is a dataset or a dataset iterator'):
         model.fit(iterator,
                   epochs=1, steps_per_epoch=2, verbose=0,
                   validation_split=0.5, validation_steps=2)
@@ -1751,7 +1788,7 @@ class TestTrainingWithDatasetIterators(test.TestCase):
       sample_weight = np.random.random((10,))
       with self.assertRaisesRegexp(
           ValueError, '`sample_weight` argument is not supported '
-          'when input `x` is a dataset iterator'):
+          'when input `x` is a dataset or a dataset iterator'):
         model.fit(
             iterator,
             epochs=1,
@@ -1760,10 +1797,6 @@ class TestTrainingWithDatasetIterators(test.TestCase):
             sample_weight=sample_weight)
 
       # Test invalid usage
-      with self.assertRaisesRegexp(ValueError,
-                                   'Instead, pass an `Iterator`'):
-        model.fit(dataset,
-                  epochs=1, steps_per_epoch=2, verbose=0)
       with self.assertRaisesRegexp(ValueError,
                                    'you should not specify a target'):
         model.fit(iterator, iterator,
@@ -1790,8 +1823,8 @@ class TestTrainingWithDatasetIterators(test.TestCase):
       metrics = ['mae']
       model.compile(optimizer, loss, metrics=metrics)
 
-      inputs = np.zeros((10, 3), dtype=np.float32)
-      targets = np.zeros((10, 4), dtype=np.float32)
+      inputs = np.zeros((10, 3))
+      targets = np.zeros((10, 4))
       dataset = dataset_ops.Dataset.from_tensor_slices((inputs, targets))
       dataset = dataset.repeat(100)
       dataset = dataset.batch(10)
@@ -1803,7 +1836,7 @@ class TestTrainingWithDatasetIterators(test.TestCase):
       ops.get_default_graph().finalize()
       model.fit(iterator, epochs=1, steps_per_epoch=2, verbose=1)
 
-  @tf_test_util.run_in_graph_and_eager_modes()
+  @tf_test_util.run_in_graph_and_eager_modes
   def test_iterators_running_out_of_data(self):
     with self.test_session():
       x = keras.layers.Input(shape=(3,), name='input')
@@ -1815,8 +1848,8 @@ class TestTrainingWithDatasetIterators(test.TestCase):
       metrics = ['mae']
       model.compile(optimizer, loss, metrics=metrics)
 
-      inputs = np.zeros((10, 3), dtype=np.float32)
-      targets = np.zeros((10, 4), dtype=np.float32)
+      inputs = np.zeros((10, 3))
+      targets = np.zeros((10, 4))
       dataset = dataset_ops.Dataset.from_tensor_slices((inputs, targets))
       dataset = dataset.repeat(2)
       dataset = dataset.batch(10)
@@ -1827,6 +1860,130 @@ class TestTrainingWithDatasetIterators(test.TestCase):
         self.assertRegexpMatches(
             str(mock_log.call_args),
             'dataset iterator ran out of data')
+
+
+class TestTrainingWithDataset(test.TestCase):
+
+  def test_calling_model_on_same_dataset(self):
+    with self.test_session():
+      x = keras.layers.Input(shape=(3,), name='input')
+      y = keras.layers.Dense(4, name='dense')(x)
+      model = keras.Model(x, y)
+
+      optimizer = RMSPropOptimizer(learning_rate=0.001)
+      loss = 'mse'
+      metrics = ['mae']
+      model.compile(optimizer, loss, metrics=metrics)
+
+      inputs = np.zeros((10, 3))
+      targets = np.zeros((10, 4))
+      dataset = dataset_ops.Dataset.from_tensor_slices((inputs, targets))
+      dataset = dataset.repeat(100)
+      dataset = dataset.batch(10)
+
+      # Call fit with validation data
+      model.fit(dataset, epochs=1, steps_per_epoch=2, verbose=0,
+                validation_data=dataset, validation_steps=2)
+      # Finalize the graph to make sure new ops aren't added when calling on the
+      # same dataset
+      ops.get_default_graph().finalize()
+      model.fit(dataset, epochs=1, steps_per_epoch=2, verbose=0,
+                validation_data=dataset, validation_steps=2)
+
+  @tf_test_util.run_in_graph_and_eager_modes
+  def test_training_and_eval_methods_on_dataset(self):
+    with self.test_session():
+      x = keras.layers.Input(shape=(3,), name='input')
+      y = keras.layers.Dense(4, name='dense')(x)
+      model = keras.Model(x, y)
+
+      optimizer = RMSPropOptimizer(learning_rate=0.001)
+      loss = 'mse'
+      metrics = ['mae']
+      model.compile(optimizer, loss, metrics=metrics)
+
+      inputs = np.zeros((10, 3))
+      targets = np.zeros((10, 4))
+      dataset = dataset_ops.Dataset.from_tensor_slices((inputs, targets))
+      dataset = dataset.repeat(100)
+      dataset = dataset.batch(10)
+
+      model.fit(dataset, epochs=1, steps_per_epoch=2, verbose=1)
+      model.evaluate(dataset, steps=2, verbose=1)
+      model.predict(dataset, steps=2)
+      model.train_on_batch(dataset)
+      model.predict_on_batch(dataset)
+
+      # Test with validation data
+      model.fit(dataset, epochs=1, steps_per_epoch=2, verbose=0,
+                validation_data=dataset, validation_steps=2)
+
+      # Test with validation split
+      with self.assertRaisesRegexp(
+          ValueError, '`validation_split` argument is not supported '
+          'when input `x` is a dataset or a dataset iterator'):
+        model.fit(dataset,
+                  epochs=1, steps_per_epoch=2, verbose=0,
+                  validation_split=0.5, validation_steps=2)
+
+      # Test with sample weight.
+      sample_weight = np.random.random((10,))
+      with self.assertRaisesRegexp(
+          ValueError, '`sample_weight` argument is not supported '
+          'when input `x` is a dataset or a dataset iterator'):
+        model.fit(
+            dataset,
+            epochs=1,
+            steps_per_epoch=2,
+            verbose=0,
+            sample_weight=sample_weight)
+
+      # Test invalid usage
+      with self.assertRaisesRegexp(ValueError,
+                                   'you should not specify a target'):
+        model.fit(dataset, dataset,
+                  epochs=1, steps_per_epoch=2, verbose=0)
+
+      with self.assertRaisesRegexp(
+          ValueError, 'you should specify the `steps_per_epoch` argument'):
+        model.fit(dataset, epochs=1, verbose=0)
+      with self.assertRaisesRegexp(ValueError,
+                                   'you should specify the `steps` argument'):
+        model.evaluate(dataset, verbose=0)
+      with self.assertRaisesRegexp(ValueError,
+                                   'you should specify the `steps` argument'):
+        model.predict(dataset, verbose=0)
+
+  def test_dataset_input_shape_validation(self):
+    with self.test_session():
+      x = keras.layers.Input(shape=(3,), name='input')
+      y = keras.layers.Dense(4, name='dense')(x)
+      model = keras.Model(x, y)
+
+      optimizer = RMSPropOptimizer(learning_rate=0.001)
+      loss = 'mse'
+      model.compile(optimizer, loss)
+
+      # User forgets to batch the dataset
+      inputs = np.zeros((10, 3))
+      targets = np.zeros((10, 4))
+      dataset = dataset_ops.Dataset.from_tensor_slices((inputs, targets))
+      dataset = dataset.repeat(100)
+
+      with self.assertRaisesRegexp(ValueError,
+                                   'expected input to have 2 dimensions'):
+        model.train_on_batch(dataset)
+
+      # Wrong input shape
+      inputs = np.zeros((10, 5))
+      targets = np.zeros((10, 4))
+      dataset = dataset_ops.Dataset.from_tensor_slices((inputs, targets))
+      dataset = dataset.repeat(100)
+      dataset = dataset.batch(10)
+
+      with self.assertRaisesRegexp(ValueError,
+                                   'expected input to have shape'):
+        model.train_on_batch(dataset)
 
 
 if __name__ == '__main__':

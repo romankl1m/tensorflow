@@ -89,6 +89,9 @@ TfLiteStatus SelectEval(TfLiteContext* context, TfLiteNode* node) {
     case kTfLiteUInt8:                                                         \
       TF_LITE_SELECT(uint8_t, op);                                             \
       break;                                                                   \
+    case kTfLiteInt16:                                                         \
+      TF_LITE_SELECT(int16_t, op);                                             \
+      break;                                                                   \
     case kTfLiteInt32:                                                         \
       TF_LITE_SELECT(int32_t, op);                                             \
       break;                                                                   \
@@ -97,7 +100,9 @@ TfLiteStatus SelectEval(TfLiteContext* context, TfLiteNode* node) {
       break;                                                                   \
     default:                                                                   \
       context->ReportError(context,                                            \
-                           "Does not support type other than bool|float|int"); \
+                           "Does not support type other than bool|float|int, " \
+                           "got %d",                                           \
+                           type);                                              \
       return kTfLiteError;                                                     \
   }
 

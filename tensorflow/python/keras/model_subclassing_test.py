@@ -31,7 +31,7 @@ from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.platform import test
-from tensorflow.python.training.checkpointable import base as checkpointable
+from tensorflow.python.training.checkpointable import data_structures
 from tensorflow.python.training.rmsprop import RMSPropOptimizer
 
 try:
@@ -56,8 +56,8 @@ class SimpleTestModel(keras.Model):
     if self.use_bn:
       self.bn = keras.layers.BatchNormalization(axis=-1)
 
-  def call(self, inputs):
-    x = self.dense1(inputs)
+  def call(self, x):
+    x = self.dense1(x)
     if self.use_dp:
       x = self.dp(x)
     if self.use_bn:
@@ -173,7 +173,7 @@ def get_nested_model_3(input_dim, num_classes):
 
 class ModelSubclassingTest(test.TestCase):
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_single_io_workflow_with_np_arrays(self):
     num_classes = 2
     num_samples = 100
@@ -192,7 +192,7 @@ class ModelSubclassingTest(test.TestCase):
     model.fit(x, y, epochs=2, batch_size=32, verbose=0)
     _ = model.evaluate(x, y, verbose=0)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_multi_io_workflow_with_np_arrays(self):
     num_classes = (2, 3)
     num_samples = 1000
@@ -251,7 +251,7 @@ class ModelSubclassingTest(test.TestCase):
       model.fit([x1, x2], [y1, y2], epochs=2, steps_per_epoch=10, verbose=0)
       _ = model.evaluate(steps=10, verbose=0)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_single_io_workflow_with_dataset_iterators(self):
     num_classes = 2
     num_samples = 10
@@ -325,7 +325,7 @@ class ModelSubclassingTest(test.TestCase):
     self.assertEqual(len(model.inputs), 2)
     self.assertEqual(len(model.outputs), 2)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_updates(self):
     # test that updates get run during training
     num_samples = 100
@@ -352,7 +352,74 @@ class ModelSubclassingTest(test.TestCase):
     y_new = model.predict(x)
     self.assertGreater(np.sum(np.abs(y_ref - y_new)), 0.1)
 
-  @test_util.run_in_graph_and_eager_modes()
+  def test_updates_and_losses_for_nested_models_in_subclassed_model(self):
+
+    # Case 1: deferred-build sequential nested in subclass.
+    class TestModel1(keras.Model):
+
+      def __init__(self):
+        super(TestModel1, self).__init__()
+        self.fc = keras.layers.Dense(10, input_shape=(784,),
+                                     activity_regularizer='l1')
+        self.bn = keras.Sequential([keras.layers.BatchNormalization(axis=1)])
+
+      def call(self, x):
+        return self.bn(self.fc(x))
+
+    with self.test_session():
+      model = TestModel1()
+
+      x = array_ops.ones(shape=[100, 784], dtype='float32')
+      model(x)
+      self.assertEqual(len(model.get_updates_for(x)), 2)
+      self.assertEqual(len(model.get_losses_for(x)), 1)
+
+    # Case 2: placeholder-sequential nested in subclass.
+    class TestModel2(keras.Model):
+
+      def __init__(self):
+        super(TestModel2, self).__init__()
+        self.fc = keras.layers.Dense(10, input_shape=(784,),
+                                     activity_regularizer='l1')
+        self.bn = keras.Sequential(
+            [keras.layers.BatchNormalization(axis=1, input_shape=(10,))])
+
+      def call(self, x):
+        return self.bn(self.fc(x))
+
+    with self.test_session():
+      model = TestModel2()
+
+      x = array_ops.ones(shape=[100, 784], dtype='float32')
+      model(x)
+      self.assertEqual(len(model.get_updates_for(x)), 2)
+      self.assertEqual(len(model.get_losses_for(x)), 1)
+
+    # Case 3: functional-API model nested in subclass.
+    inputs = keras.Input((10,))
+    outputs = keras.layers.BatchNormalization(axis=1)(inputs)
+    bn = keras.Model(inputs, outputs)
+
+    class TestModel3(keras.Model):
+
+      def __init__(self):
+        super(TestModel3, self).__init__()
+        self.fc = keras.layers.Dense(10, input_shape=(784,),
+                                     activity_regularizer='l1')
+        self.bn = bn
+
+      def call(self, x):
+        return self.bn(self.fc(x))
+
+    with self.test_session():
+      model = TestModel3()
+
+      x = array_ops.ones(shape=[100, 784], dtype='float32')
+      model(x)
+      self.assertEqual(len(model.get_updates_for(x)), 2)
+      self.assertEqual(len(model.get_losses_for(x)), 1)
+
+  @test_util.run_in_graph_and_eager_modes
   def test_training_and_inference_behavior(self):
     # test that dropout is applied in training and not inference
 
@@ -380,7 +447,7 @@ class ModelSubclassingTest(test.TestCase):
     loss = model.train_on_batch(x, y)
     self.assertGreater(loss, 0.1)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_training_methods(self):
     # test fit, train_on_batch
     # on different input types: list, dict
@@ -433,14 +500,14 @@ class ModelSubclassingTest(test.TestCase):
     model = MultiIOTestModel(num_classes=num_classes, use_bn=True)
     model.predict_on_batch([x1, x2])
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_trainable_mutation(self):
     # test that you can change `trainable` on a model or layer, and that
     # it freezes the model state during training
     # TODO(fchollet): add test after we unify BN behavior in eager and symbolic.
     pass
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_saving(self):
 
     num_classes = (2, 3)
@@ -482,7 +549,7 @@ class ModelSubclassingTest(test.TestCase):
       self.assertAllClose(y_ref_1, y1, atol=1e-5)
       self.assertAllClose(y_ref_2, y2, atol=1e-5)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_summary(self):
 
     class ToString(object):
@@ -508,7 +575,7 @@ class ModelSubclassingTest(test.TestCase):
     model.summary(print_fn=print_fn)
     self.assertTrue('Trainable params: 587' in print_fn.contents)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_subclass_nested_in_subclass(self):
     num_classes = 2
     num_samples = 100
@@ -531,7 +598,7 @@ class ModelSubclassingTest(test.TestCase):
     self.assertEqual(len(model.trainable_weights),
                      6 + len(model.test_net.trainable_weights))
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_graph_nested_in_subclass(self):
     num_classes = 2
     num_samples = 100
@@ -554,7 +621,7 @@ class ModelSubclassingTest(test.TestCase):
     self.assertEqual(len(model.trainable_weights),
                      6 + len(model.test_net.trainable_weights))
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_subclass_nested_in_graph(self):
     num_classes = 2
     num_samples = 100
@@ -576,7 +643,7 @@ class ModelSubclassingTest(test.TestCase):
         len(model.non_trainable_weights), 4)
     self.assertEqual(len(model.trainable_weights), 12)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_support_for_manual_training_arg(self):
     # In most cases, the `training` argument is left unspecified, in which
     # case it defaults to value corresponding to the Model method being used
@@ -612,8 +679,8 @@ class ModelSubclassingTest(test.TestCase):
       def __init__(self):
         super(Foo, self).__init__()
         self.isdep = keras.layers.Dense(1)
-        self.notdep = checkpointable.NoDependency(keras.layers.Dense(2))
-        self.notdep_var = checkpointable.NoDependency(
+        self.notdep = data_structures.NoDependency(keras.layers.Dense(2))
+        self.notdep_var = data_structures.NoDependency(
             resource_variable_ops.ResourceVariable(1., name='notdep_var'))
 
     m = Foo()
@@ -621,6 +688,51 @@ class ModelSubclassingTest(test.TestCase):
     self.assertEqual(1, len(m._checkpoint_dependencies))
     self.assertIs(m.isdep, m._checkpoint_dependencies[0].ref)
     self.assertEqual('notdep_var:0', m.notdep_var.name)
+
+  def test_extra_variable(self):
+
+    class ExtraVar(keras.Model):
+
+      def __init__(self):
+        super(ExtraVar, self).__init__()
+        self.dense = keras.layers.Dense(1)
+        self.var = resource_variable_ops.ResourceVariable(1.)
+        self.not_trainable_var = resource_variable_ops.ResourceVariable(
+            2., trainable=False)
+
+      def call(self, inputs):
+        return self.dense(inputs + self.var)
+
+    m = ExtraVar()
+    self.assertTrue(m.trainable)
+    self.assertEqual([m.dense], m.layers)
+    self.assertEqual([m.var, m.not_trainable_var], m.variables)
+    self.assertEqual([m.var], m.trainable_variables)
+    self.assertEqual([m.not_trainable_var], m.non_trainable_variables)
+    m.trainable = False
+    self.assertEqual([m.var, m.not_trainable_var], m.variables)
+    self.assertEqual([], m.trainable_variables)
+    self.assertEqual([m.var, m.not_trainable_var], m.non_trainable_variables)
+    m.trainable = True
+
+    m(array_ops.ones([1, 1]))
+
+    self.assertEqual([m.dense.kernel, m.dense.bias], m.dense.variables)
+    self.assertEqual([m.dense.kernel, m.dense.bias], m.dense.weights)
+
+    self.assertEqual([m.dense.kernel, m.dense.bias, m.var, m.not_trainable_var],
+                     m.variables)
+    self.assertEqual([m.dense.kernel, m.dense.bias, m.var],
+                     m.trainable_variables)
+    self.assertEqual([m.not_trainable_var], m.non_trainable_variables)
+
+    m.dense.trainable = False
+    self.assertEqual(
+        [m.var, m.dense.kernel, m.dense.bias, m.not_trainable_var],
+        m.variables)
+    self.assertEqual([m.var], m.trainable_variables)
+    self.assertEqual([m.dense.kernel, m.dense.bias, m.not_trainable_var],
+                     m.non_trainable_variables)
 
 
 class CustomCallModel(keras.Model):
@@ -640,7 +752,7 @@ class CustomCallModel(keras.Model):
 
 class CustomCallSignatureTests(test.TestCase):
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_no_inputs_in_signature(self):
     model = CustomCallModel()
     first = array_ops.ones([2, 3])
@@ -654,7 +766,7 @@ class CustomCallSignatureTests(test.TestCase):
     output = model(first, second=second, training=False)
     self.assertAllClose(expected_output, self.evaluate(output))
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_inputs_in_signature(self):
 
     class HasInputsAndOtherPositional(keras.Model):
@@ -671,7 +783,7 @@ class CustomCallSignatureTests(test.TestCase):
       x1, x2 = keras.Input((1, 1)), keras.Input((1, 1))
       model(x1, x2)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_kwargs_in_signature(self):
 
     class HasKwargs(keras.Model):
@@ -685,7 +797,7 @@ class CustomCallSignatureTests(test.TestCase):
     if not context.executing_eagerly():
       six.assertCountEqual(self, [arg], model.inputs)
 
-  @test_util.run_in_graph_and_eager_modes()
+  @test_util.run_in_graph_and_eager_modes
   def test_args_in_signature(self):
 
     class HasArgs(keras.Model):
