@@ -17,10 +17,10 @@ limitations under the License.
 #define EIGEN_USE_THREADS
 
 #include "tensorflow/core/kernels/gather_nd_op.h"
+#include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/core/kernels/bounds_check.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mem.h"
@@ -188,12 +188,13 @@ Status DoGatherNd(OpKernelContext* c, const Tensor& params,
 
     // bad_i will only return >= 0 on CPUs right now.
     if (bad_i >= 0) {
+      auto shape = indices.shape();
+      shape.RemoveLastDims(1);
       return errors::InvalidArgument(
-          "flat indices[", bad_i, ", :] = [",
+          "indices", SliceDebugString(shape, bad_i), " = [",
           str_util::Join(
               gtl::ArraySlice<Index>(&indices_mat(bad_i, 0), indices_nd), ", "),
-          "] does not index into param (shape: ", params.shape().DebugString(),
-          ").");
+          "] does not index into param shape ", params.shape().DebugString());
     }
   }
   return Status::OK();

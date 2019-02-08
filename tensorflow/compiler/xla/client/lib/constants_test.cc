@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/compiler/xla/client/lib/constants.h"
-#include "tensorflow/compiler/xla/client/xla_client/xla_builder.h"
+#include "tensorflow/compiler/xla/client/xla_builder.h"
 #include "tensorflow/compiler/xla/test.h"
 #include "tensorflow/compiler/xla/tests/client_library_test_base.h"
 #include "tensorflow/compiler/xla/tests/test_macros.h"
@@ -152,6 +152,13 @@ XLA_TEST_F(ConstantsTest, MaxValueF32) {
   XlaBuilder builder(TestName());
   MaxValue(&builder, F32);
   ComputeAndCompareR0<float>(&builder, std::numeric_limits<float>::infinity(),
+                             {});
+}
+
+XLA_TEST_F(ConstantsTest, NanValueF32) {
+  XlaBuilder builder(TestName());
+  NanValue(&builder, F32);
+  ComputeAndCompareR0<float>(&builder, std::numeric_limits<float>::quiet_NaN(),
                              {});
 }
 

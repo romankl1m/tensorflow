@@ -43,33 +43,60 @@ py_library(
     ],
 )
 
+py_library(
+    name = "resnet_preprocessing",
+    srcs = ["resnet_preprocessing.py"],
+    srcs_version = "PY2AND3",
+    tags = ["local"],
+    deps = [
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
+py_library(
+    name = "imagenet_input",
+    srcs = ["imagenet_input.py"],
+    srcs_version = "PY2AND3",
+    tags = ["local"],
+    deps = [
+        ":resnet_preprocessing",
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
 # Tests
 cuda_py_test(
     name = "ops_test",
-    size = "large",
+    size = "medium",
     srcs = ["ops_test.py"],
     additional_deps = [
         ":ops",
         "//tensorflow:tensorflow_py",
     ],
+    shard_count = 4,
+    tags = [
+        "oss_serial",
+    ],
 )
 
 cuda_py_test(
     name = "blocks_test",
-    size = "large",
+    size = "medium",
     srcs = ["blocks_test.py"],
     additional_deps = [
         ":blocks",
         "//tensorflow:tensorflow_py",
     ],
+    shard_count = 4,
     tags = [
+        "no_oss",  # b/123045964
         "optonly",
     ],
 )
 
 cuda_py_test(
     name = "revnet_test",
-    size = "large",
+    size = "medium",
     srcs = ["revnet_test.py"],
     additional_deps = [
         ":blocks_test",
@@ -77,9 +104,11 @@ cuda_py_test(
         ":revnet",
         "//tensorflow:tensorflow_py",
     ],
+    shard_count = 4,
     tags = [
         "no_pip",  # depends on blocks_test, which is not available in pip package
         "optonly",
+        "oss_serial",
     ],
 )
 
@@ -106,9 +135,52 @@ py_binary(
     name = "main",
     srcs = ["main.py"],
     srcs_version = "PY2AND3",
+    deps = [":main_lib"],
+)
+
+py_library(
+    name = "main_lib",
+    srcs = ["main.py"],
+    srcs_version = "PY2AND3",
     deps = [
         ":cifar_input",
         ":config",
+        ":revnet",
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
+py_binary(
+    name = "main_estimator",
+    srcs = ["main_estimator.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":cifar_input",
+        ":main_lib",
+        ":revnet",
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
+py_library(
+    name = "main_estimator_lib",
+    srcs = ["main_estimator.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":cifar_input",
+        ":main_lib",
+        ":revnet",
+        "//tensorflow:tensorflow_py",
+    ],
+)
+
+py_library(
+    name = "main_estimator_tpu_lib",
+    srcs = ["main_estimator_tpu.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":cifar_input",
+        ":main_lib",
         ":revnet",
         "//tensorflow:tensorflow_py",
     ],

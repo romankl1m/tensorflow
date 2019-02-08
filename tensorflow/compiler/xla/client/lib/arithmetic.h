@@ -18,8 +18,8 @@ limitations under the License.
 
 #include <memory>
 
-#include "tensorflow/compiler/xla/client/xla_client/xla_builder.h"
-#include "tensorflow/compiler/xla/client/xla_client/xla_computation.h"
+#include "tensorflow/compiler/xla/client/xla_builder.h"
+#include "tensorflow/compiler/xla/client/xla_computation.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
 
 namespace xla {
@@ -56,6 +56,14 @@ XlaComputation CreateScalarOrComputation(PrimitiveType type,
 //
 // Note: if predicates is zero-sized, Any() vacuously returns false.
 XlaOp Any(XlaOp predicates);
+
+// Returns the argmax of `input` along `axis`. `output_type` is the type to
+// use for the output.
+XlaOp ArgMax(XlaOp input, PrimitiveType output_type, int axis);
+
+// Returns the argmin of `input` along `axis`. `output_type` is the type to
+// use for the output.
+XlaOp ArgMin(XlaOp input, PrimitiveType output_type, int axis);
 
 }  // namespace xla
 

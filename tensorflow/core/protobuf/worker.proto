@@ -466,6 +466,11 @@ message RecvBufRequest {
   // Optional, for annotating the timeline.
   string src_device = 8;
   string dst_device = 9;
+
+  // Depending on the RPC system in use, it may be necessary to set this
+  // id to detect resends of RPCs where the server is not aware that
+  // the prior RPC failed.
+  int64 request_id = 10;
 }
 
 message RecvBufResponse {
@@ -530,6 +535,7 @@ message CompleteInstanceRequest {
 message CompleteInstanceResponse {
   int32 instance_key = 1;
   int32 source_rank = 2;
+  bytes communicator_key = 3;
 }
 
 // Request for next agreed-upon step_id for the specified graph_keys.
