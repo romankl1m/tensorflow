@@ -35,7 +35,9 @@ limitations under the License.
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/platform/macros.h"
+#include "tensorflow/core/platform/tracing.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
 
 #define VALUE_IN_DEBUG_STRING false
 
@@ -63,7 +65,7 @@ int64 CollectiveAdapter::AlignedChunkElts(int64 elt_bytes, int64 total_elts,
       (chunk_bytes < EIGEN_MAX_ALIGN_BYTES)
           ? (EIGEN_MAX_ALIGN_BYTES - chunk_bytes)
           : (EIGEN_MAX_ALIGN_BYTES - (chunk_bytes % EIGEN_MAX_ALIGN_BYTES));
-  CHECK_EQ(0, diff % elt_bytes);
+  DCHECK_EQ(0, diff % elt_bytes);
   base_chunk_elts += (diff / elt_bytes);
   DCHECK_EQ(0, ((base_chunk_elts * elt_bytes) % EIGEN_MAX_ALIGN_BYTES))
       << "total_elts=" << total_elts << " num_chunks=" << num_chunks
@@ -78,17 +80,23 @@ class CollectiveAdapterImpl : public CollectiveAdapter {
  public:
   // Takes ownership of output and prepares to properly alias its chunks.
   // Ownership is taken because the shape may temporarily change.
-  CollectiveAdapterImpl(Tensor* output, int64 num_chunks, Allocator* allocator)
+  CollectiveAdapterImpl(Tensor* output, int64 num_chunks, Allocator* allocator,
+                        bool align_chunks)
       : output_(std::move(*output)),
         dt_(output_.dtype()),
         old_shape_(output_.shape()),
         num_chunks_(num_chunks),
         allocator_(allocator),
         total_elts_(output_.NumElements()),
-        chunk_elts_(AlignedChunkElts(sizeof(T), total_elts_, num_chunks_)),
+        chunk_elts_(align_chunks
+                        ? AlignedChunkElts(sizeof(T), total_elts_, num_chunks_)
+                        : total_elts_ / num_chunks_),
         data_start_(reinterpret_cast<T*>(DMAHelper::base(&output_))),
         data_end_(data_start_ + total_elts_) {
-    CHECK_GT(chunk_elts_, 0);
+    if (!align_chunks) {
+      DCHECK_EQ(total_elts_, num_chunks_ * chunk_elts_);
+    }
+    DCHECK_GT(chunk_elts_, 0);
     Flatten();
   }
 
@@ -157,8 +165,8 @@ class CollectiveAdapterImpl : public CollectiveAdapter {
     return t;
   }
 
-  Tensor Scalar(Allocator* a) const override {
-    Tensor t(a, dt_, TensorShape({}));
+  Tensor Scalar(Allocator* a, const AllocationAttributes& attr) const override {
+    Tensor t(a, dt_, TensorShape({}), attr);
     return t;
   }
 
@@ -176,19 +184,24 @@ class CollectiveAdapterImpl : public CollectiveAdapter {
 }  // namespace
 
 CollectiveAdapter* MakeCollectiveAdapter(Tensor* output, int num_chunks,
-                                         Allocator* allocator) {
+                                         Allocator* allocator,
+                                         bool align_chunks) {
   switch (output->dtype()) {
     case DT_FLOAT:
-      return new CollectiveAdapterImpl<float>(output, num_chunks, allocator);
+      return new CollectiveAdapterImpl<float>(output, num_chunks, allocator,
+                                              align_chunks);
       break;
     case DT_DOUBLE:
-      return new CollectiveAdapterImpl<double>(output, num_chunks, allocator);
+      return new CollectiveAdapterImpl<double>(output, num_chunks, allocator,
+                                               align_chunks);
       break;
     case DT_INT32:
-      return new CollectiveAdapterImpl<int32>(output, num_chunks, allocator);
+      return new CollectiveAdapterImpl<int32>(output, num_chunks, allocator,
+                                              align_chunks);
       break;
     case DT_INT64:
-      return new CollectiveAdapterImpl<int64>(output, num_chunks, allocator);
+      return new CollectiveAdapterImpl<int64>(output, num_chunks, allocator,
+                                              align_chunks);
       break;
     default:
       LOG(FATAL) << "Unsupported type " << output->dtype()
@@ -227,6 +240,7 @@ void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
 
   Tensor* output = ctx->mutable_output(0);
   const Tensor* input = (col_params.instance.type == REDUCTION_COLLECTIVE ||
+                         col_params.instance.type == GATHER_COLLECTIVE ||
                          (col_params.instance.type == BROADCAST_COLLECTIVE &&
                           col_params.is_source))
                             ? &ctx->input(0)
@@ -248,11 +262,16 @@ void BaseCollectiveExecutor::ExecuteAsync(OpKernelContext* ctx,
     delete col_impl;
     return;
   }
-  // Run in an I/O thread, so as not to starve the executor threads.
-  // TODO(b/80529858): Instead of forking every per-device Collective
-  // Op off into its own thread, consider queuing them on a
-  // fixed-size thread-pool dedicated to running CollectiveOps.
-  SchedClosure([col_impl, col_ctx, done_safe]() {
+  // Run on an unbounded work queue that can handle blocking work so as to not
+  // starve executor threads.
+  remote_access_->RunClosure([col_impl, col_ctx, done_safe, ctx]() {
+    profiler::TraceMe activity(
+        [&] {
+          return strings::StrCat(ctx->op_kernel().name(), ":",
+                                 ctx->op_kernel().type_string(),
+                                 "#id=", ctx->step_id(), "#");
+        },
+        profiler::TraceMeLevel::kInfo);
     col_impl->Run([col_impl, col_ctx, done_safe](const Status& s) {
       done_safe(s);
       delete col_ctx;

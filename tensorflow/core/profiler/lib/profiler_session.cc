@@ -14,41 +14,90 @@ limitations under the License.
 ==============================================================================*/
 
 #include "tensorflow/core/profiler/lib/profiler_session.h"
+
+#include <cstddef>
 #include <string>
-#include "tensorflow/contrib/tpu/profiler/trace_events.pb.h"
-#include "tensorflow/core/common_runtime/eager/context.h"
+#include <vector>
+
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "tensorflow/core/common_runtime/step_stats_collector.h"
+#include "tensorflow/core/lib/core/error_codes.pb.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
-#include "tensorflow/core/profiler/internal/gpu/tracer.h"
-#include "tensorflow/core/profiler/internal/runtime/eager_profiler.h"
 #include "tensorflow/core/protobuf/config.pb.h"
+#include "tensorflow/core/protobuf/trace_events.pb.h"
 
 namespace tensorflow {
-
 namespace {
 
+// Track whether there's an active ProfilerSession.
+// Prevents another ProfilerSession from creating ProfilerInterface(s), as they
+// use singletons that do not allow concurrent profiling request (e.g.,
+// DeviceTracer).
+std::atomic<bool> session_active = ATOMIC_VAR_INIT(false);
+
+// Given a node_name in the format "op_name:op_type", returns the "op_type".
+// If the "op_type" is missing, returns the node_name.
+// This is done so all ops with the same type appear in the same color in trace
+// viewer.
+inline std::string EventName(absl::string_view node_name) {
+  std::vector<absl::string_view> parts = absl::StrSplit(node_name, ':');
+  return std::string(parts.back());
+}
+
+void AssignLanes(RunMetadata* run_metadata) {
+  for (size_t device_id = 0;
+       device_id < run_metadata->step_stats().dev_stats_size(); ++device_id) {
+    auto* device_stats =
+        run_metadata->mutable_step_stats()->mutable_dev_stats(device_id);
+    if (device_stats->thread_names_size() > 0 ||
+        device_stats->node_stats_size() == 0) {
+      continue;
+    }
+    std::vector<uint64> lanes;
+    for (auto ns = device_stats->mutable_node_stats()->rbegin();
+         ns != device_stats->mutable_node_stats()->rend(); ns++) {
+      uint64 end_micros = ns->all_start_micros() + ns->all_end_rel_micros();
+      bool found_lane = false;
+      for (size_t l = 0; l < lanes.size(); l++) {
+        if (end_micros <= lanes[l]) {
+          ns->set_thread_id(l);
+          found_lane = true;
+          lanes[l] = ns->all_start_micros();
+          break;
+        }
+      }
+      if (!found_lane) {
+        ns->set_thread_id(lanes.size());
+        lanes.push_back(ns->all_start_micros());
+      }
+    }
+  }
+}
+
 void ConvertRunMetadataToTraceEvent(RunMetadata* run_metadata,
-                                    tpu::Trace* trace,
-                                    const uint64 profile_start_time_micros) {
+                                    profiler::Trace* trace,
+                                    const uint64 profile_start_time_micros,
+                                    const uint64 profile_end_time_micros) {
+  AssignLanes(run_metadata);
   auto trace_devices = trace->mutable_devices();
-  // TODO(fishx): use a lighter representation instead of GraphDef to insert
-  // python information into trace event.
 
   for (size_t device_id = 0;
        device_id < run_metadata->step_stats().dev_stats_size(); ++device_id) {
     // Create device
     auto* device_stats =
         run_metadata->mutable_step_stats()->mutable_dev_stats(device_id);
-    tensorflow::tpu::Device device;
+    profiler::Device device;
     device.set_name(device_stats->device());
     device.set_device_id(device_id);
-    tensorflow::tpu::Resource resource;
+    profiler::Resource resource;
     resource.set_name("0");
     resource.set_resource_id(0);
     (*device.mutable_resources())[0] = resource;
     for (const auto& thread_name : device_stats->thread_names()) {
-      tensorflow::tpu::Resource resource;
+      profiler::Resource resource;
       resource.set_resource_id(thread_name.first);
       resource.set_name(thread_name.second);
       (*device.mutable_resources())[thread_name.first] = resource;
@@ -58,15 +107,16 @@ void ConvertRunMetadataToTraceEvent(RunMetadata* run_metadata,
     // Emit events.
     for (auto node :
          run_metadata->step_stats().dev_stats(device_id).node_stats()) {
+      if (node.all_start_micros() < profile_start_time_micros ||
+          node.all_start_micros() + node.all_end_rel_micros() >
+              profile_end_time_micros) {
+        continue;
+      }
       auto* event = trace->add_trace_events();
       auto* args = event->mutable_args();
       event->set_device_id(device_id);
-      if (device_stats->device().find("host:CPU") != string::npos) {
-        event->set_resource_id(node.thread_id());
-      } else {
-        event->set_resource_id(0);
-      }
-      event->set_name(node.node_name());
+      event->set_resource_id(node.thread_id());
+      event->set_name(EventName(node.node_name()));
       event->set_timestamp_ps(
           (node.all_start_micros() - profile_start_time_micros) *
           EnvTime::kMicrosToPicos);
@@ -78,12 +128,10 @@ void ConvertRunMetadataToTraceEvent(RunMetadata* run_metadata,
 
   // TODO(fishx): Convert allocation data as well.
 }
-
 }  // namespace
 
-/*static*/ std::unique_ptr<ProfilerSession> ProfilerSession::Create(
-    ProfilerContext* const context) {
-  return absl::WrapUnique(new ProfilerSession(context));
+/*static*/ std::unique_ptr<ProfilerSession> ProfilerSession::Create() {
+  return absl::WrapUnique(new ProfilerSession());
 }
 
 Status ProfilerSession::Status() {
@@ -91,39 +139,59 @@ Status ProfilerSession::Status() {
   return status_;
 }
 
-Status ProfilerSession::SerializeToString(string* content) {
+Status ProfilerSession::CollectData(RunMetadata* run_metadata) {
   mutex_lock l(mutex_);
   if (!status_.ok()) return status_;
   for (auto& profiler : profilers_) {
     profiler->Stop().IgnoreError();
   }
-  RunMetadata run_metadata;
+
   for (auto& profiler : profilers_) {
-    profiler->CollectData(&run_metadata).IgnoreError();
+    profiler->CollectData(run_metadata).IgnoreError();
   }
 
-  tpu::Trace trace;
+  if (active_) {
+    // Allow another session to start.
+    session_active.store(false);
+    active_ = false;
+  }
 
-  ConvertRunMetadataToTraceEvent(&run_metadata, &trace, start_time_micros_);
+  return Status::OK();
+}
+
+Status ProfilerSession::SerializeToString(string* content) {
+  RunMetadata run_metadata;
+  TF_RETURN_IF_ERROR(CollectData(&run_metadata));
+
+  profiler::Trace trace;
+  ConvertRunMetadataToTraceEvent(
+      &run_metadata, &trace, start_time_micros_,
+      Env::Default()->NowNanos() / EnvTime::kMicrosToNanos);
 
   trace.SerializeToString(content);
   return Status::OK();
 }
 
-ProfilerSession::ProfilerSession(ProfilerContext* const context)
-    : start_time_micros_(Env::Default()->NowNanos() / EnvTime::kMicrosToNanos) {
-  LOG(INFO) << "Profile Session started.";
-
-  if (context->eager_context != nullptr) {
-    profilers_.push_back(tensorflow::profiler::runtime::EagerProfiler::Create(
-        context->eager_context));
+ProfilerSession::ProfilerSession()
+    : active_(!session_active.exchange(true)),
+      start_time_micros_(Env::Default()->NowNanos() / EnvTime::kMicrosToNanos) {
+  if (!active_) {
+    status_ = tensorflow::Status(error::UNAVAILABLE,
+                                 "Another profiler session is active.");
+    return;
   }
-  profilers_.push_back(tensorflow::profiler::gpu::Tracer::Create());
 
+  LOG(INFO) << "Profiler session started.";
+
+  CreateProfilers(&profilers_);
   status_ = Status::OK();
 
   for (auto& profiler : profilers_) {
-    profiler->Start().IgnoreError();
+    auto start_status = profiler->Start();
+    if (!start_status.ok()) {
+      LOG(WARNING) << "Encountered error while starting profiler: "
+                   << start_status.ToString();
+    }
   }
 }
 
@@ -131,6 +199,10 @@ ProfilerSession::~ProfilerSession() {
   for (auto& profiler : profilers_) {
     profiler->Stop().IgnoreError();
   }
-}
 
+  if (active_) {
+    // Allow another session to start.
+    session_active.store(false);
+  }
+}
 }  // namespace tensorflow

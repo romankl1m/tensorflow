@@ -165,7 +165,7 @@ final class NativeInterpreterWrapper implements AutoCloseable {
     this.inferenceDurationNanoseconds = inferenceDurationNanoseconds;
   }
 
-  private static native boolean run(long interpreterHandle, long errorHandle);
+  private static native void run(long interpreterHandle, long errorHandle);
 
   /** Resizes dimensions of a specific input. */
   void resizeInput(int idx, int[] dims) {
@@ -191,6 +191,10 @@ final class NativeInterpreterWrapper implements AutoCloseable {
   void modifyGraphWithDelegate(Delegate delegate) {
     applyDelegate(interpreterHandle, errorHandle, delegate.getNativeHandle());
     delegates.add(delegate);
+  }
+
+  void resetVariableTensors() {
+    resetVariableTensors(interpreterHandle, errorHandle);
   }
 
   /** Gets index of an input given its name. */
@@ -373,6 +377,8 @@ final class NativeInterpreterWrapper implements AutoCloseable {
 
   private static native void applyDelegate(
       long interpreterHandle, long errorHandle, long delegateHandle);
+
+  private static native void resetVariableTensors(long interpreterHandle, long errorHandle);
 
   private static native void delete(long errorHandle, long modelHandle, long interpreterHandle);
 

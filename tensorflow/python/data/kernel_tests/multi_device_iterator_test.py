@@ -18,57 +18,29 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import time
 from absl.testing import parameterized
-import six
+import numpy as np
 
 from tensorflow.core.protobuf import config_pb2
+from tensorflow.python.client import session
 from tensorflow.python.data.experimental.ops import optimization
 from tensorflow.python.data.kernel_tests import test_base
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.data.ops import multi_device_iterator_ops
 from tensorflow.python.eager import context
+from tensorflow.python.eager import def_function
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import errors
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import data_flow_ops
 from tensorflow.python.platform import test
-
-
-# memory_profiler might not be available in the OSS version of TensorFlow.
-try:
-  import memory_profiler  # pylint:disable=g-import-not-at-top
-except ImportError:
-  memory_profiler = None
 
 
 @test_util.run_all_in_graph_and_eager_modes
 class MultiDeviceIteratorTest(test_base.DatasetTestBase,
                               parameterized.TestCase):
-
-  def assertNotIncreasingMemory(self,
-                                f,
-                                num_iters=100000,
-                                increase_threshold_absolute_mb=10):
-    """Assert memory usage doesn't increase beyond given threshold for f."""
-
-    with context.eager_mode():
-      # Warm up.
-      f()
-
-      # Wait for background threads to start up and take over memory.
-      # FIXME: The nature of this test leaves few other options. Maybe there
-      # is a better way to do this.
-      time.sleep(4)
-      initial = memory_profiler.memory_usage(-1)[0]
-      for _ in six.moves.range(num_iters):
-        f()
-      increase = memory_profiler.memory_usage(-1)[0] - initial
-      assert increase < increase_threshold_absolute_mb, (
-          "Increase is too high. Initial memory usage: %f MB. Increase: %f MB. "
-          "Maximum allowed increase: %f") % (initial, increase,
-                                             increase_threshold_absolute_mb)
 
   @parameterized.parameters(0, 1, 42,)
   @test_util.run_v1_only("b/121264236")
@@ -99,24 +71,6 @@ class MultiDeviceIteratorTest(test_base.DatasetTestBase,
         elem_on_1, elem_on_2 = multi_device_iterator.get_next()
         self.evaluate(elem_on_1)
         self.evaluate(elem_on_2)
-
-  @test_util.run_v1_only("b/121264236")
-  def testEagerNoMemoryLeak(self):
-    if not context.executing_eagerly():
-      self.skipTest("Only eager mode test")
-    if memory_profiler is None:
-      self.skipTest("memory_profiler required to run this test")
-
-    def f():
-      dataset = dataset_ops.Dataset.range(10)
-      multi_device_iterator = multi_device_iterator_ops.MultiDeviceIterator(
-          dataset, ["/cpu:1", "/cpu:2"])
-      self.evaluate(multi_device_iterator.get_next())
-      del multi_device_iterator
-      del dataset
-
-    self.assertNotIncreasingMemory(
-        f, num_iters=100, increase_threshold_absolute_mb=175)
 
   @test_util.run_v1_only("b/121264236")
   def testOneOnSameDevice(self):
@@ -255,7 +209,9 @@ class MultiDeviceIteratorTest(test_base.DatasetTestBase,
     init_op = multi_device_iterator.initializer
 
     config = config_pb2.ConfigProto(device_count={"CPU": 3})
-    with self.test_session(config=config) as sess:
+    pool = config.session_inter_op_thread_pool.add()
+    pool.num_threads = 2
+    with session.Session(config=config) as sess:
       for i in range(1000):
         sess.run(init_op, feed_dict={epoch: i})
         self.assertEqual([(i, 0), (i, 1)], self.evaluate([elem_on_1,
@@ -383,6 +339,123 @@ class MultiDeviceIteratorTest(test_base.DatasetTestBase,
         elem_on_1, elem_on_2 = multi_device_iterator.get_next()
         self.evaluate(elem_on_1)
         self.evaluate(elem_on_2)
+
+
+class MultiDeviceIteratorV2Test(test_base.DatasetTestBase):
+
+  @test_util.run_v2_only
+  def testBasic(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("No GPU available")
+
+    with ops.device("/cpu:0"):
+      dataset = dataset_ops.Dataset.range(1000)
+
+    mdi = multi_device_iterator_ops.MultiDeviceIteratorV2(
+        dataset, ["/cpu:0", "/gpu:0"])
+
+    for i, el in enumerate(mdi):
+      self.assertEqual([i * 2, i * 2 + 1], [el[0].numpy(), el[1].numpy()])
+
+  @test_util.run_v2_only
+  def testBasicFunction(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("No GPU available")
+
+    queue = data_flow_ops.FIFOQueue(10, dtypes.int64)
+
+    @def_function.function
+    def fn():
+      with ops.device("/cpu:0"):
+        dataset = dataset_ops.Dataset.range(10)
+      iterator = multi_device_iterator_ops.MultiDeviceIteratorV2(
+          dataset, ["/cpu:0", "/gpu:0"])
+      for _ in range(5):
+        el0, el1 = next(iterator)
+        queue.enqueue(el0)
+        queue.enqueue(el1)
+
+    fn()
+
+    for i in range(10):
+      self.assertEqual(queue.dequeue().numpy(), i)
+
+  @test_util.run_v2_only
+  def testFunctionError(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("No GPU available")
+
+    # In this test we verify that a function that raises an error ends up
+    # properly deallocating the iterator resource.
+
+    queue = data_flow_ops.FIFOQueue(10, dtypes.int64)
+    queue.enqueue(0)
+
+    def init_fn(n):
+      return n
+
+    def next_fn(_):
+      ds = dataset_ops.Dataset.range(0)
+      return next(iter(ds))
+
+    def finalize_fn(n):
+      queue.enqueue(0)
+      return n
+
+    @def_function.function
+    def fn():
+      dataset = dataset_ops._GeneratorDataset(1, init_fn, next_fn, finalize_fn)
+      iterator = multi_device_iterator_ops.MultiDeviceIteratorV2(
+          dataset, ["/cpu:0", "/gpu:0"])
+      next(iterator)
+
+    with self.assertRaises(errors.OutOfRangeError):
+      fn()
+
+    self.assertEqual(queue.size().numpy(), 2)
+
+  @test_util.run_v2_only
+  def testMultipleInitializations(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("No GPU available")
+
+    with ops.device("/cpu:0"):
+      dataset = dataset_ops.Dataset.range(1000)
+
+    for _ in range(5):
+      multi_device_iterator = multi_device_iterator_ops.MultiDeviceIteratorV2(
+          dataset, ["/cpu:0", "/gpu:0"])
+      for i, el in enumerate(multi_device_iterator):
+        self.assertEqual([i * 2, i * 2 + 1], [el[0].numpy(), el[1].numpy()])
+
+  @test_util.run_v2_only
+  def testLimitedRetracing(self):
+    if not test_util.is_gpu_available():
+      self.skipTest("No GPU available")
+
+    trace_count = [0]
+
+    @def_function.function
+    def f(iterator):
+      trace_count[0] += 1
+      counter = np.int64(0)
+      for _ in range(5):
+        elem = next(iterator)
+        counter += elem[0]
+        counter += elem[1]
+      return counter
+
+    dataset = dataset_ops.Dataset.range(10)
+    dataset2 = dataset_ops.Dataset.range(20)
+
+    for _ in range(10):
+      multi_device_iterator = multi_device_iterator_ops.MultiDeviceIteratorV2(
+          dataset, ["/cpu:0", "/gpu:0"])
+      self.assertEqual(self.evaluate(f(multi_device_iterator)), 45)
+      multi_device_iterator2 = multi_device_iterator_ops.MultiDeviceIteratorV2(
+          dataset2, ["/cpu:0", "/gpu:0"])
+      self.assertEqual(self.evaluate(f(multi_device_iterator2)), 45)
+      self.assertEqual(trace_count[0], 1)
 
 
 if __name__ == "__main__":

@@ -20,21 +20,22 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
-import sys
 import types
 import numpy as np
 import six
 
 from tensorflow.python.eager import context
+from tensorflow.python.eager import def_function
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.keras import backend as K
+from tensorflow.python.keras.engine import base_layer_utils
 from tensorflow.python.keras.engine.base_layer import Layer
 from tensorflow.python.keras.losses import binary_crossentropy
 from tensorflow.python.keras.losses import categorical_crossentropy
 from tensorflow.python.keras.losses import categorical_hinge
-from tensorflow.python.keras.losses import cosine_proximity
+from tensorflow.python.keras.losses import cosine_similarity
 from tensorflow.python.keras.losses import hinge
 from tensorflow.python.keras.losses import kullback_leibler_divergence
 from tensorflow.python.keras.losses import logcosh
@@ -49,7 +50,6 @@ from tensorflow.python.keras.utils import metrics_utils
 from tensorflow.python.keras.utils.generic_utils import deserialize_keras_object
 from tensorflow.python.keras.utils.generic_utils import serialize_keras_object
 from tensorflow.python.keras.utils.generic_utils import to_list
-from tensorflow.python.keras.utils.losses_utils import squeeze_or_expand_dimensions
 from tensorflow.python.keras.utils.tf_utils import is_tensor_or_variable
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import confusion_matrix
@@ -58,6 +58,7 @@ from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn
 from tensorflow.python.ops import variables as tf_variables
 from tensorflow.python.ops import weights_broadcast_ops
+from tensorflow.python.ops.losses import util as tf_losses_utils
 from tensorflow.python.util.tf_export import keras_export
 from tensorflow.tools.docs import doc_controls
 
@@ -84,7 +85,7 @@ class Metric(Layer):
   model.add(tf.keras.layers.Dense(64, activation='relu'))
   model.add(tf.keras.layers.Dense(10, activation='softmax'))
 
-  model.compile(optimizer=tf.train.RMSPropOptimizer(0.01),
+  model.compile(optimizer=tf.compat.v1.train.RMSPropOptimizer(0.01),
                 loss=tf.keras.losses.categorical_crossentropy,
                 metrics=[tf.keras.metrics.CategoricalAccuracy()])
 
@@ -109,28 +110,26 @@ class Metric(Layer):
   Example subclass implementation:
 
   ```
-  class BinaryTruePositives(Metric):
-    def __init__(self, name='binary_true_positives', dtype=None):
-      super(BinaryTruePositives, self).__init__(name=name, dtype=dtype)
-      self.true_positives = self.add_weight(
-          'true_positives', initializer=init_ops.zeros_initializer)
+  class BinaryTruePositives(tf.keras.metrics.Metric):
+
+    def __init__(self, name='binary_true_positives', **kwargs):
+      super(BinaryTruePositives, self).__init__(name=name, **kwargs)
+      self.true_positives = self.add_weight(name='tp', initializer='zeros')
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-      y_true = math_ops.cast(y_true, dtypes.bool)
-      y_pred = math_ops.cast(y_pred, dtypes.bool)
-      y_pred, y_true, sample_weight = squeeze_or_expand_dimensions(
-          y_pred, y_true, sample_weight)
+      y_true = tf.cast(y_true, tf.bool)
+      y_pred = tf.cast(y_pred, tf.bool)
 
-      values = math_ops.logical_and(
-          math_ops.equal(y_true, True), math_ops.equal(y_pred, True))
-      values = math_ops.cast(values, self._dtype)
+      values = tf.logical_and(tf.equal(y_true, True), tf.equal(y_pred, True))
+      values = tf.cast(values, self.dtype)
       if sample_weight is not None:
-        sample_weight = math_ops.cast(sample_weight, self._dtype)
-        values = math_ops.multiply(values, sample_weight)
-      self.true_positives.assign_add(math_ops.reduce_sum(values))
+        sample_weight = tf.cast(sample_weight, self.dtype)
+        sample_weight = tf.broadcast_weights(sample_weight, values)
+        values = tf.multiply(values, sample_weight)
+      self.true_positives.assign_add(tf.reduce_sum(values))
 
     def result(self):
-      return array_ops.identity(self.true_positives)
+      return self.true_positives
   ```
   """
 
@@ -138,29 +137,27 @@ class Metric(Layer):
     super(Metric, self).__init__(name=name, dtype=dtype, **kwargs)
     self.stateful = True  # All metric layers are stateful.
     self.built = True
-    self._dtype = K.floatx() if dtype is None else dtypes.as_dtype(dtype).name
+    if not base_layer_utils.v2_dtype_behavior_enabled():
+      # We only do this when the V2 behavior is not enabled, as when it is
+      # enabled, the dtype already defaults to floatx.
+      self._dtype = K.floatx() if dtype is None else dtypes.as_dtype(dtype).name
 
   def __new__(cls, *args, **kwargs):
     obj = super(Metric, cls).__new__(cls)
 
-    if sys.version_info < (3,):
-      # Wrap methods in `weakmethod` function to remove binding and create a
-      # weak reference. This is to remove reference cycle that is created here.
-      # This is not an issue in python versions > 3.
-      if context.executing_eagerly():
-        obj.update_state = metrics_utils.weakmethod(obj.update_state)
-      obj.update_state = metrics_utils.weakmethod(
-          types.MethodType(
-              metrics_utils.update_state_wrapper(obj.update_state), obj))
-      result = metrics_utils.weakmethod(obj.result)
-      obj.result = metrics_utils.weakmethod(
-          types.MethodType(metrics_utils.result_wrapper(result), obj))
+    # TODO(psv): We are excluding wrapping `update_state` of built-in metrics
+    # with function here because of b/121302287. With this, built-in metrics
+    # will continue to work with TPUs and custom metrics will not, however
+    # users writing custom metrics need not worry about control dependencies
+    # and returning ops.
+    if cls.__module__ == Metric.__module__:
+      update_state_fn = obj.update_state
     else:
-      obj.update_state = types.MethodType(
-          metrics_utils.update_state_wrapper(obj.update_state), obj)
-      obj.result = types.MethodType(
-          metrics_utils.result_wrapper(obj.result), obj)
+      update_state_fn = def_function.function(obj.update_state)
 
+    obj.update_state = types.MethodType(
+        metrics_utils.update_state_wrapper(update_state_fn), obj)
+    obj.result = types.MethodType(metrics_utils.result_wrapper(obj.result), obj)
     return obj
 
   def __call__(self, *args, **kwargs):
@@ -174,20 +171,27 @@ class Metric(Layer):
     Returns:
       The metric value tensor.
     """
-    update_op = self.update_state(*args, **kwargs)
-    with ops.control_dependencies([update_op]):
-      result_t = self.result()
 
-      # We are adding the metric object as metadata on the result tensor.
-      # This is required when we want to use a metric with `add_metric` API on
-      # a Model/Layer in graph mode. This metric instance will later be used
-      # to reset variable state after each epoch of training.
-      # Example:
-      #   model = Model()
-      #   model.add_metric(Mean()(values), name='mean')
-      if not context.executing_eagerly():
+    def replica_local_fn(*args, **kwargs):
+      """Updates the state of the metric in a replica-local context."""
+      update_op = self.update_state(*args, **kwargs)  # pylint: disable=not-callable
+      with ops.control_dependencies([update_op]):
+        result_t = self.result()  # pylint: disable=not-callable
+
+        # We are adding the metric object as metadata on the result tensor.
+        # This is required when we want to use a metric with `add_metric` API on
+        # a Model/Layer in graph mode. This metric instance will later be used
+        # to reset variable state after each epoch of training.
+        # Example:
+        #   model = Model()
+        #   mean = Mean()
+        #   model.add_metric(mean(values), name='mean')
         result_t._metric_obj = self  # pylint: disable=protected-access
-      return result_t
+        return result_t
+
+    from tensorflow.python.keras.distribute import distributed_training_utils  # pylint:disable=g-import-not-at-top
+    return distributed_training_utils.call_replica_local_fn(
+        replica_local_fn, *args, **kwargs)
 
   @property
   def dtype(self):
@@ -219,11 +223,14 @@ class Metric(Layer):
       As a result, code should generally work the same way with graph or
       eager execution.
 
+    Please use `tf.config.experimental_run_functions_eagerly(True)` to execute
+    this function eagerly for debugging or profiling.
+
     Args:
       *args:
       **kwargs: A mini-batch of inputs to the Metric.
     """
-    NotImplementedError('Must be implemented in subclasses.')
+    raise NotImplementedError('Must be implemented in subclasses.')
 
   @abc.abstractmethod
   def result(self):
@@ -232,7 +239,7 @@ class Metric(Layer):
     Result computation is an idempotent operation that simply calculates the
     metric value using the state variables.
     """
-    NotImplementedError('Must be implemented in subclasses.')
+    raise NotImplementedError('Must be implemented in subclasses.')
 
   ### For use by subclasses ###
   @doc_controls.for_subclass_implementers
@@ -244,6 +251,18 @@ class Metric(Layer):
                  initializer=None,
                  dtype=None):
     """Adds state variable. Only for use by subclasses."""
+    from tensorflow.python.distribute import distribution_strategy_context as ds_context  # pylint:disable=g-import-not-at-top
+    from tensorflow.python.keras.distribute import distributed_training_utils  # pylint:disable=g-import-not-at-top
+
+    if ds_context.has_strategy():
+      strategy = ds_context.get_strategy()
+    else:
+      strategy = None
+
+    # TODO(b/120571621): Make `ON_READ` work with Keras metrics on TPU.
+    if distributed_training_utils.is_tpu_strategy(strategy):
+      synchronization = tf_variables.VariableSynchronization.ON_WRITE
+
     return super(Metric, self).add_weight(
         name=name,
         shape=shape,
@@ -270,12 +289,13 @@ class Reduce(Metric):
     """
     super(Reduce, self).__init__(name=name, dtype=dtype)
     self.reduction = reduction
-    self.total = self.add_weight(
-        'total', initializer=init_ops.zeros_initializer)
-    if reduction in [metrics_utils.Reduction.SUM_OVER_BATCH_SIZE,
-                     metrics_utils.Reduction.WEIGHTED_MEAN]:
-      self.count = self.add_weight(
-          'count', initializer=init_ops.zeros_initializer)
+    with ops.init_scope():
+      self.total = self.add_weight(
+          'total', initializer=init_ops.zeros_initializer)
+      if reduction in [metrics_utils.Reduction.SUM_OVER_BATCH_SIZE,
+                       metrics_utils.Reduction.WEIGHTED_MEAN]:
+        self.count = self.add_weight(
+            'count', initializer=init_ops.zeros_initializer)
 
   def update_state(self, values, sample_weight=None):
     """Accumulates statistics for computing the reduction metric.
@@ -291,12 +311,15 @@ class Reduce(Metric):
     Returns:
       Update op.
     """
+    [values], sample_weight = \
+        metrics_utils.ragged_assert_compatible_and_get_flat_values(
+            [values], sample_weight)
     values = math_ops.cast(values, self._dtype)
     if sample_weight is not None:
       sample_weight = math_ops.cast(sample_weight, self._dtype)
       # Update dimensions of weights to match with values if possible.
-      values, _, sample_weight = squeeze_or_expand_dimensions(
-          values, None, sample_weight)
+      values, _, sample_weight = tf_losses_utils.squeeze_or_expand_dimensions(
+          values, sample_weight=sample_weight)
       try:
         # Broadcast weights if possible.
         sample_weight = weights_broadcast_ops.broadcast_weights(
@@ -373,7 +396,7 @@ class Sum(Reduce):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.add_metric(tf.keras.metrics.Sum(name='sum_1')(outputs))
   model.compile('sgd', loss='mse')
   ```
@@ -415,7 +438,7 @@ class Mean(Reduce):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.add_metric(tf.keras.metrics.Mean(name='mean_1')(outputs))
   model.compile('sgd', loss='mse')
   ```
@@ -459,7 +482,7 @@ class MeanRelativeError(Mean):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
     'sgd',
     loss='mse',
@@ -494,12 +517,15 @@ class MeanRelativeError(Mean):
     """
     y_true = math_ops.cast(y_true, self._dtype)
     y_pred = math_ops.cast(y_pred, self._dtype)
-    y_pred, y_true, sample_weight = squeeze_or_expand_dimensions(
-        y_pred, y_true, sample_weight)
+    [y_pred, y_true], sample_weight = \
+        metrics_utils.ragged_assert_compatible_and_get_flat_values(
+            [y_pred, y_true], sample_weight)
+    y_pred, y_true = tf_losses_utils.squeeze_or_expand_dimensions(
+        y_pred, y_true)
 
     y_pred, self.normalizer = confusion_matrix.remove_squeezable_dimensions(
         y_pred, self.normalizer)
-    y_pred.shape.assert_is_compatible_with(y_pred.shape)
+    y_pred.shape.assert_is_compatible_with(y_true.shape)
     relative_errors = math_ops.div_no_nan(
         math_ops.abs(y_true - y_pred), self.normalizer)
 
@@ -547,8 +573,11 @@ class MeanMetricWrapper(Mean):
     """
     y_true = math_ops.cast(y_true, self._dtype)
     y_pred = math_ops.cast(y_pred, self._dtype)
-    y_pred, y_true, sample_weight = squeeze_or_expand_dimensions(
-        y_pred, y_true, sample_weight)
+    [y_true, y_pred], sample_weight = \
+        metrics_utils.ragged_assert_compatible_and_get_flat_values(
+            [y_true, y_pred], sample_weight)
+    y_pred, y_true = tf_losses_utils.squeeze_or_expand_dimensions(
+        y_pred, y_true)
 
     matches = self._fn(y_true, y_pred, **self._fn_kwargs)
     return super(MeanMetricWrapper, self).update_state(
@@ -589,7 +618,7 @@ class Accuracy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.Accuracy()])
   ```
   """
@@ -625,7 +654,7 @@ class BinaryAccuracy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.BinaryAccuracy()])
   ```
   """
@@ -675,7 +704,7 @@ class CategoricalAccuracy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
     'sgd',
     loss='mse',
@@ -723,7 +752,7 @@ class SparseCategoricalAccuracy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
       'sgd',
       loss='mse',
@@ -751,7 +780,7 @@ class TopKCategoricalAccuracy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.TopKCategoricalAccuracy()])
   ```
   """
@@ -784,7 +813,7 @@ class SparseTopKCategoricalAccuracy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
     'sgd',
     metrics=[tf.keras.metrics.SparseTopKCategoricalAccuracy()])
@@ -898,7 +927,7 @@ class FalsePositives(_ConfusionMatrixConditionCount):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.FalsePositives()])
   ```
   """
@@ -948,7 +977,7 @@ class FalseNegatives(_ConfusionMatrixConditionCount):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.FalseNegatives()])
   ```
   """
@@ -998,7 +1027,7 @@ class TrueNegatives(_ConfusionMatrixConditionCount):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.TrueNegatives()])
   ```
   """
@@ -1048,7 +1077,7 @@ class TruePositives(_ConfusionMatrixConditionCount):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.TruePositives()])
   ```
   """
@@ -1108,7 +1137,7 @@ class Precision(Metric):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.Precision()])
   ```
   """
@@ -1234,7 +1263,7 @@ class Recall(Metric):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.Recall()])
   ```
   """
@@ -1425,7 +1454,7 @@ class SensitivityAtSpecificity(SensitivitySpecificityBase):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
       'sgd',
       loss='mse',
@@ -1506,7 +1535,7 @@ class SpecificityAtSensitivity(SensitivitySpecificityBase):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
       'sgd',
       loss='mse',
@@ -1573,7 +1602,8 @@ class AUC(Metric):
   (computed using the aforementioned variables). The `num_thresholds` variable
   controls the degree of discretization with larger numbers of thresholds more
   closely approximating the true AUC. The quality of the approximation may vary
-  dramatically depending on `num_thresholds`.
+  dramatically depending on `num_thresholds`. The `thresholds` parameter can be
+  used to manually specify thresholds which split the predictions more evenly.
 
   For best results, `predictions` should be distributed approximately uniformly
   in the range [0, 1] and not peaked around 0 or 1. The quality of the AUC
@@ -1601,7 +1631,7 @@ class AUC(Metric):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', loss='mse', metrics=[tf.keras.metrics.AUC()])
   ```
   """
@@ -1611,7 +1641,8 @@ class AUC(Metric):
                curve='ROC',
                summation_method='interpolation',
                name=None,
-               dtype=None):
+               dtype=None,
+               thresholds=None):
     """Creates an `AUC` instance.
 
     Args:
@@ -1628,10 +1659,14 @@ class AUC(Metric):
           'majoring' that does the opposite.
       name: (Optional) string name of the metric instance.
       dtype: (Optional) data type of the metric result.
+      thresholds: (Optional) A list of floating point values to use as the
+        thresholds for discretizing the curve. If set, the `num_thresholds`
+        parameter is ignored. Values should be in [0, 1]. Endpoint thresholds
+        equal to {-epsilon, 1+epsilon} for a small positive epsilon value will
+        be automatically included with these to correctly handle predictions
+        equal to exactly 0 or 1.
     """
     # Validate configurations.
-    if num_thresholds <= 1:
-      raise ValueError('`num_thresholds` must be > 1.')
     if isinstance(curve, metrics_utils.AUCCurve) and curve not in list(
         metrics_utils.AUCCurve):
       raise ValueError('Invalid curve: "{}". Valid options are: "{}"'.format(
@@ -1645,7 +1680,24 @@ class AUC(Metric):
               summation_method, list(metrics_utils.AUCSummationMethod)))
 
     # Update properties.
-    self.num_thresholds = num_thresholds
+    if thresholds is not None:
+      # If specified, use the supplied thresholds.
+      self.num_thresholds = len(thresholds) + 2
+      thresholds = sorted(thresholds)
+    else:
+      if num_thresholds <= 1:
+        raise ValueError('`num_thresholds` must be > 1.')
+
+      # Otherwise, linearly interpolate (num_thresholds - 2) thresholds in
+      # (0, 1).
+      self.num_thresholds = num_thresholds
+      thresholds = [(i + 1) * 1.0 / (num_thresholds - 1)
+                    for i in range(num_thresholds - 2)]
+
+    # Add an endpoint "threshold" below zero and above one for either
+    # threshold method to account for floating point imprecisions.
+    self.thresholds = [0.0 - K.epsilon()] + thresholds + [1.0 + K.epsilon()]
+
     if isinstance(curve, metrics_utils.AUCCurve):
       self.curve = curve
     else:
@@ -1660,27 +1712,20 @@ class AUC(Metric):
     # Create metric variables
     self.true_positives = self.add_weight(
         'true_positives',
-        shape=(num_thresholds,),
+        shape=(self.num_thresholds,),
         initializer=init_ops.zeros_initializer)
     self.true_negatives = self.add_weight(
         'true_negatives',
-        shape=(num_thresholds,),
+        shape=(self.num_thresholds,),
         initializer=init_ops.zeros_initializer)
     self.false_positives = self.add_weight(
         'false_positives',
-        shape=(num_thresholds,),
+        shape=(self.num_thresholds,),
         initializer=init_ops.zeros_initializer)
     self.false_negatives = self.add_weight(
         'false_negatives',
-        shape=(num_thresholds,),
+        shape=(self.num_thresholds,),
         initializer=init_ops.zeros_initializer)
-
-    # Compute `num_thresholds` thresholds in [0, 1]
-    thresholds = [
-        (i + 1) * 1.0 / (num_thresholds - 1) for i in range(num_thresholds - 2)
-    ]
-    self.thresholds = [0.0 - K.epsilon()] + thresholds + [1.0 + K.epsilon()]
-    # epsilon - to account for floating point imprecisions.
 
   def update_state(self, y_true, y_pred, sample_weight=None):
     """Accumulates confusion matrix statistics.
@@ -1807,58 +1852,71 @@ class AUC(Metric):
         name=self.name)
 
   def reset_states(self):
-    num_thresholds = len(self.thresholds)
     K.batch_set_value(
-        [(v, np.zeros((num_thresholds,))) for v in self.variables])
+        [(v, np.zeros((self.num_thresholds,))) for v in self.variables])
 
   def get_config(self):
     config = {
         'num_thresholds': self.num_thresholds,
         'curve': self.curve.value,
         'summation_method': self.summation_method.value,
+        # We remove the endpoint thresholds as an inverse of how the thresholds
+        # were initialized. This ensures that a metric initialized from this
+        # config has the same thresholds.
+        'thresholds': self.thresholds[1:-1],
     }
     base_config = super(AUC, self).get_config()
     return dict(list(base_config.items()) + list(config.items()))
 
 
-@keras_export('keras.metrics.CosineProximity')
-class CosineProximity(MeanMetricWrapper):
-  """Computes the cosine distance between the labels and predictions.
+@keras_export('keras.metrics.CosineSimilarity')
+class CosineSimilarity(MeanMetricWrapper):
+  """Computes the cosine similarity between the labels and predictions.
+
+  cosine similarity = (a . b) / ||a|| ||b||
+  [Cosine Similarity](https://en.wikipedia.org/wiki/Cosine_similarity)
 
   For example, if `y_true` is [0, 1, 1], and `y_pred` is [1, 0, 1], the cosine
-  proximity is -0.5.
+  similarity is 0.5.
 
-  This metric keeps the average cosine distance between `predictions` and
+  This metric keeps the average cosine similarity between `predictions` and
   `labels` over a stream of data.
 
   Usage:
   ```python
-  m = tf.metrics.CosineProximity()
-  m.update_state([0, 1, 1], [1, 0, 1])
-  print('Final result: ', m.result().numpy())  # Final result: -0.5
+  m = tf.keras.metrics.CosineSimilarity(axis=1)
+  m.update_state([[0., 1.], [1., 1.]], [[1., 0.], [1., 1.]])
+  # l2_norm(y_true) = [[0., 1.], [1./1.414], 1./1.414]]]
+  # l2_norm(y_pred) = [[1., 0.], [1./1.414], 1./1.414]]]
+  # l2_norm(y_true) . l2_norm(y_pred) = [[0., 0.], [0.5, 0.5]]
+  # result = mean(sum(l2_norm(y_true) . l2_norm(y_pred), axis=1))
+         = ((0. + 0.) +  (0.5 + 0.5)) / 2
+
+  print('Final result: ', m.result().numpy())  # Final result: 0.5
   ```
 
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
       'sgd',
       loss='mse',
-      metrics=[tf.metrics.CosineProximity()])
+      metrics=[tf.keras.metrics.CosineSimilarity(axis=1)])
   ```
   """
 
-  def __init__(self, name='cosine_proximity', dtype=None, axis=-1):
-    """Creates a `CosineProximity` instance.
+  def __init__(self, name='cosine_similarity', dtype=None, axis=-1):
+    """Creates a `CosineSimilarity` instance.
 
     Args:
       name: (Optional) string name of the metric instance.
       dtype: (Optional) data type of the metric result.
       axis: (Optional) Defaults to -1. The dimension along which the cosine
-        proximity is computed.
+        similarity is computed.
     """
-    super(CosineProximity, self).__init__(cosine, name, dtype=dtype, axis=axis)
+    super(CosineSimilarity, self).__init__(
+        cosine_similarity, name, dtype=dtype, axis=axis)
 
 
 @keras_export('keras.metrics.MeanAbsoluteError')
@@ -1870,7 +1928,7 @@ class MeanAbsoluteError(MeanMetricWrapper):
 
   Usage:
   ```python
-  m = tf.metrics.MeanAbsoluteError()
+  m = tf.keras.metrics.MeanAbsoluteError()
   m.update_state([0., 0., 1., 1.], [1., 1., 1., 0.])
   print('Final result: ', m.result().numpy())  # Final result: 0.75
   ```
@@ -1878,7 +1936,7 @@ class MeanAbsoluteError(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.MeanAbsoluteError()])
   ```
   """
@@ -1906,7 +1964,7 @@ class MeanAbsolutePercentageError(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.MeanAbsolutePercentageError()])
   ```
   """
@@ -1934,7 +1992,7 @@ class MeanSquaredError(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.MeanSquaredError()])
   ```
   """
@@ -1962,7 +2020,7 @@ class MeanSquaredLogarithmicError(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.MeanSquaredLogarithmicError()])
   ```
   """
@@ -1996,7 +2054,7 @@ class Hinge(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.Hinge()])
   ```
   """
@@ -2029,7 +2087,7 @@ class SquaredHinge(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.SquaredHinge()])
   ```
   """
@@ -2056,7 +2114,7 @@ class CategoricalHinge(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.CategoricalHinge()])
   ```
   """
@@ -2080,7 +2138,7 @@ class RootMeanSquaredError(Mean):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.RootMeanSquaredError()])
   ```
   """
@@ -2103,8 +2161,8 @@ class RootMeanSquaredError(Mean):
     """
     y_true = math_ops.cast(y_true, self._dtype)
     y_pred = math_ops.cast(y_pred, self._dtype)
-    y_pred, y_true, sample_weight = squeeze_or_expand_dimensions(
-        y_pred, y_true, sample_weight)
+    y_pred, y_true = tf_losses_utils.squeeze_or_expand_dimensions(
+        y_pred, y_true)
     error_sq = math_ops.squared_difference(y_pred, y_true)
     return super(RootMeanSquaredError, self).update_state(
         error_sq, sample_weight=sample_weight)
@@ -2130,7 +2188,7 @@ class LogCoshError(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.LogCoshError()])
   ```
   """
@@ -2156,7 +2214,7 @@ class Poisson(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.Poisson()])
   ```
   """
@@ -2167,7 +2225,7 @@ class Poisson(MeanMetricWrapper):
 
 @keras_export('keras.metrics.KLDivergence')
 class KLDivergence(MeanMetricWrapper):
-  """Computes Kullback Leibler divergence metric between `y_true` and `y_pred`.
+  """Computes Kullback-Leibler divergence metric between `y_true` and `y_pred`.
 
   `metric = y_true * log(y_true / y_pred)`
 
@@ -2182,7 +2240,7 @@ class KLDivergence(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile('sgd', metrics=[tf.keras.metrics.KLDivergence()])
   ```
   """
@@ -2223,7 +2281,7 @@ class MeanIoU(Metric):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
     'sgd',
     loss='mse',
@@ -2265,6 +2323,10 @@ class MeanIoU(Metric):
     Returns:
       Update op.
     """
+
+    y_true = math_ops.cast(y_true, self._dtype)
+    y_pred = math_ops.cast(y_pred, self._dtype)
+
     # Flatten the input if its rank > 1.
     if y_pred.shape.ndims > 1:
       y_pred = array_ops.reshape(y_pred, [-1])
@@ -2329,7 +2391,7 @@ class MeanTensor(Metric):
   Usage:
 
   ```python
-  m = tf.metrics.MeanTensor()
+  m = tf.keras.metrics.MeanTensor()
   m.update_state([0, 1, 2, 3])
   m.update_state([4, 5, 6, 7])
   print('Result: ', m.result().numpy())  # Result: [2, 3, 4, 5]
@@ -2387,15 +2449,15 @@ class MeanTensor(Metric):
     elif values.shape != self._shape:
       raise ValueError('MeanTensor input values must always have the same '
                        'shape. Expected shape (set during the first call): {}. '
-                       'Got: {}'.format(self._shape, values.get_shape()))
+                       'Got: {}'.format(self._shape, values.shape))
 
     num_values = array_ops.ones_like(values)
     if sample_weight is not None:
       sample_weight = math_ops.cast(sample_weight, self._dtype)
 
       # Update dimensions of weights to match with values if possible.
-      values, _, sample_weight = squeeze_or_expand_dimensions(
-          values, None, sample_weight)
+      values, _, sample_weight = tf_losses_utils.squeeze_or_expand_dimensions(
+          values, sample_weight=sample_weight)
       try:
         # Broadcast weights if possible.
         sample_weight = weights_broadcast_ops.broadcast_weights(
@@ -2457,7 +2519,7 @@ class BinaryCrossentropy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
       'sgd',
       loss='mse',
@@ -2482,7 +2544,6 @@ class BinaryCrossentropy(MeanMetricWrapper):
         e.g. `label_smoothing=0.2` means that we will use a value of `0.1` for
         label `0` and `0.9` for label `1`"
     """
-    label_smoothing = ops.convert_to_tensor(label_smoothing, dtype=K.floatx())
 
     super(BinaryCrossentropy, self).__init__(
         binary_crossentropy,
@@ -2523,7 +2584,7 @@ class CategoricalCrossentropy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
     'sgd',
     loss='mse',
@@ -2546,7 +2607,6 @@ class CategoricalCrossentropy(MeanMetricWrapper):
                dtype=None,
                from_logits=False,
                label_smoothing=0):
-    label_smoothing = ops.convert_to_tensor(label_smoothing, dtype=K.floatx())
 
     super(CategoricalCrossentropy, self).__init__(
         categorical_crossentropy,
@@ -2597,7 +2657,7 @@ class SparseCategoricalCrossentropy(MeanMetricWrapper):
   Usage with tf.keras API:
 
   ```python
-  model = keras.models.Model(inputs, outputs)
+  model = tf.keras.Model(inputs, outputs)
   model.compile(
     'sgd',
     loss='mse',
@@ -2669,8 +2729,8 @@ class SumOverBatchSizeMetricWrapper(SumOverBatchSize):
   def update_state(self, y_true, y_pred, sample_weight=None):
     y_true = math_ops.cast(y_true, self._dtype)
     y_pred = math_ops.cast(y_pred, self._dtype)
-    y_pred, y_true, sample_weight = squeeze_or_expand_dimensions(
-        y_pred, y_true, sample_weight)
+    y_pred, y_true = tf_losses_utils.squeeze_or_expand_dimensions(
+        y_pred, y_true)
 
     matches = self._fn(y_true, y_pred, **self._fn_kwargs)
     return super(SumOverBatchSizeMetricWrapper, self).update_state(
@@ -2685,7 +2745,10 @@ class SumOverBatchSizeMetricWrapper(SumOverBatchSize):
 
 
 def accuracy(y_true, y_pred):
-  y_pred.get_shape().assert_is_compatible_with(y_true.get_shape())
+  [y_pred, y_true], _ = \
+      metrics_utils.ragged_assert_compatible_and_get_flat_values(
+          [y_pred, y_true])
+  y_pred.shape.assert_is_compatible_with(y_true.shape)
   if y_true.dtype != y_pred.dtype:
     y_pred = math_ops.cast(y_pred, y_true.dtype)
   return math_ops.cast(math_ops.equal(y_true, y_pred), K.floatx())
@@ -2708,8 +2771,8 @@ def categorical_accuracy(y_true, y_pred):
 
 @keras_export('keras.metrics.sparse_categorical_accuracy')
 def sparse_categorical_accuracy(y_true, y_pred):
-  y_pred_rank = ops.convert_to_tensor(y_pred).get_shape().ndims
-  y_true_rank = ops.convert_to_tensor(y_true).get_shape().ndims
+  y_pred_rank = ops.convert_to_tensor(y_pred).shape.ndims
+  y_true_rank = ops.convert_to_tensor(y_true).shape.ndims
   # If the shape of y_true is (num_samples, 1), squeeze to (num_samples,)
   if (y_true_rank is not None) and (y_pred_rank is not None) and (len(
       K.int_shape(y_true)) == len(K.int_shape(y_pred))):
@@ -2726,20 +2789,21 @@ def sparse_categorical_accuracy(y_true, y_pred):
 
 @keras_export('keras.metrics.top_k_categorical_accuracy')
 def top_k_categorical_accuracy(y_true, y_pred, k=5):
-  return K.mean(
-      nn.in_top_k(y_pred, math_ops.argmax(y_true, axis=-1), k), axis=-1)
+  return math_ops.cast(
+      nn.in_top_k(y_pred, math_ops.argmax(y_true, axis=-1), k), K.floatx())
 
 
 @keras_export('keras.metrics.sparse_top_k_categorical_accuracy')
 def sparse_top_k_categorical_accuracy(y_true, y_pred, k=5):
-  y_pred_rank = ops.convert_to_tensor(y_pred).get_shape().ndims
-  y_true_rank = ops.convert_to_tensor(y_true).get_shape().ndims
+  y_pred_rank = ops.convert_to_tensor(y_pred).shape.ndims
+  y_true_rank = ops.convert_to_tensor(y_true).shape.ndims
   # If the shape of y_true is (num_samples, 1), squeeze to (num_samples,)
   if (y_true_rank is not None) and (y_pred_rank is not None) and (len(
       K.int_shape(y_true)) == len(K.int_shape(y_pred))):
     y_true = array_ops.squeeze(y_true, [-1])
 
-  return K.mean(nn.in_top_k(y_pred, math_ops.cast(y_true, 'int32'), k), axis=-1)
+  return math_ops.cast(
+      nn.in_top_k(y_pred, math_ops.cast(y_true, 'int32'), k), K.floatx())
 
 # Aliases
 
@@ -2747,13 +2811,14 @@ mse = MSE = mean_squared_error
 mae = MAE = mean_absolute_error
 mape = MAPE = mean_absolute_percentage_error
 msle = MSLE = mean_squared_logarithmic_error
-cosine = cosine_proximity
+cosine_proximity = cosine_similarity
 
 
 def clone_metric(metric):
   """Returns a clone of the metric if stateful, otherwise returns it as is."""
   if isinstance(metric, Metric):
-    return metric.__class__.from_config(metric.get_config())
+    with ops.init_scope():
+      return metric.__class__.from_config(metric.get_config())
   return metric
 
 

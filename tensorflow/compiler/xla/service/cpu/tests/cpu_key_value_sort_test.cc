@@ -29,7 +29,7 @@ HloModule KeyValueSort
 compare {
   p.0.lhs = f32[] parameter(0)
   p.0.rhs = f32[] parameter(1)
-  ROOT lt = pred[] less-than(p.0.lhs, p.0.rhs)
+  ROOT lt = pred[] compare(p.0.lhs, p.0.rhs), direction=LT
 }
 
 ENTRY main {
@@ -44,7 +44,7 @@ CHECK: call void @__xla_cpu_runtime_KeyValueSort
 )";
 
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
-                          ParseHloString(hlo_text));
+                          ParseAndReturnUnverifiedModule(hlo_text));
 
   CpuAotCompilationOptions options{
       /*triple=*/"x86_64", /*cpu_name=*/"", /*features=*/"",

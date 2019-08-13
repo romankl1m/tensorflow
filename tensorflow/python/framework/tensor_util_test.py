@@ -23,16 +23,17 @@ import numpy as np
 
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
-from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import tensor_util
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_state_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import variables
 from tensorflow.python.platform import test
 
 
+@test_util.run_all_in_graph_and_eager_modes
 class TensorUtilTest(test.TestCase):
 
   def testFloat(self):
@@ -754,24 +755,6 @@ class TensorUtilTest(test.TestCase):
     self.assertFalse(tensor_util.ShapeEquals(t, [1, 4]))
     self.assertFalse(tensor_util.ShapeEquals(t, [4]))
 
-  @test_util.run_deprecated_v1
-  def testMockArray(self):
-
-    class MockArray(object):
-
-      def __init__(self, array):
-        self.array = array
-
-      def __array__(self, dtype=None):
-        return np.asarray(self.array, dtype)
-
-    with self.cached_session() as sess:
-      ma = MockArray(np.array([10, 20, 30]))
-      t = ops.convert_to_tensor(ma)
-      a = self.evaluate(t)
-      self.assertEquals(np.int64, a.dtype)
-      self.assertAllClose(np.array([10, 20, 30], dtype=np.int64), a)
-
 
 class IsTensorTest(test.TestCase):
 
@@ -953,6 +936,22 @@ class ConstantValueTest(test.TestCase):
     c_val = tensor_util.constant_value(tf_val)
     self.assertAllEqual(c_val, [[False, True], [True, False]])
 
+  def testLiteral(self):
+    x = "hi"
+    self.assertIs(x, tensor_util.constant_value(x))
+
+  def testNumpyNdarray(self):
+    np_val = np.random.rand(3, 4, 7).astype(np.float32)
+    self.assertIs(np_val, tensor_util.constant_value(np_val))
+
+  def testVariable(self):
+    var = variables.Variable(1.0, name="variable_node")
+    self.assertIsNone(tensor_util.constant_value(var))
+
+  def testVariableV1(self):
+    var = variables.VariableV1(1.0, name="variable_node")
+    self.assertIsNone(tensor_util.constant_value(var))
+
 
 class ConstantValueAsShapeTest(test.TestCase):
 
@@ -1079,6 +1078,16 @@ class ConstantValueAsShapeTest(test.TestCase):
     with self.assertRaises(ValueError):
       tf_val = constant_op.constant([[10], [20], [30]])[:, 0:]
       c_val = tensor_util.constant_value_as_shape(tf_val)
+
+
+class ShapeTensorTest(test_util.TensorFlowTestCase):
+
+  @test_util.run_in_graph_and_eager_modes
+  def testConversion(self):
+    """Make sure fully known TensorShape objects convert to Tensors."""
+    shape = tensor_shape.TensorShape([1, tensor_shape.Dimension(2)])
+    shape_tensor = tensor_util.shape_tensor(shape)
+    self.assertAllEqual((1, 2), shape_tensor)
 
 
 if __name__ == "__main__":

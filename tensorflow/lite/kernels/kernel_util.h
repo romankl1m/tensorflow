@@ -44,15 +44,26 @@ inline TfLiteTensor* GetTemporary(TfLiteContext* context, TfLiteNode* node,
                                   int index) {
   return &context->tensors[node->temporaries->data[index]];
 }
+inline const TfLiteTensor* GetIntermediates(TfLiteContext* context,
+                                            TfLiteNode* node, int index) {
+  return &context->tensors[node->intermediates->data[index]];
+}
 inline int NumInputs(const TfLiteNode* node) { return node->inputs->size; }
 inline int NumOutputs(const TfLiteNode* node) { return node->outputs->size; }
+inline int NumIntermediates(const TfLiteNode* node) {
+  return node->intermediates->size;
+}
 
-inline int64_t NumElements(const TfLiteTensor* t) {
+inline int64_t NumElements(const TfLiteIntArray* dims) {
   int64_t count = 1;
-  for (int i = 0; i < NumDimensions(t); ++i) {
-    count *= SizeOfDimension(t, i);
+  for (int i = 0; i < dims->size; ++i) {
+    count *= dims->data[i];
   }
   return count;
+}
+
+inline int64_t NumElements(const TfLiteTensor* t) {
+  return NumElements(t->dims);
 }
 
 inline const TfLiteTensor* GetOptionalInputTensor(TfLiteContext* context,
@@ -84,6 +95,13 @@ inline void SetTensorToDynamic(TfLiteTensor* tensor) {
   }
 }
 
+// Determines whether it is a hybrid op - one that has float inputs and
+// quantized weights.
+inline bool IsHybridOp(const TfLiteTensor* input, const TfLiteTensor* weight) {
+  return ((weight->type == kTfLiteUInt8 || weight->type == kTfLiteInt8) &&
+          input->type == kTfLiteFloat32);
+}
+
 // Check dimensionality match and populate OpData for Conv and DepthwiseConv.
 TfLiteStatus PopulateConvolutionQuantizationParams(
     TfLiteContext* context, const TfLiteTensor* input,
@@ -99,6 +117,12 @@ TfLiteStatus GetQuantizedConvolutionMultipler(TfLiteContext* context,
                                               const TfLiteTensor* input,
                                               const TfLiteTensor* filter,
                                               const TfLiteTensor* bias,
+                                              TfLiteTensor* output,
+                                              double* multiplier);
+
+TfLiteStatus GetQuantizedConvolutionMultipler(TfLiteContext* context,
+                                              const TfLiteTensor* input,
+                                              const TfLiteTensor* filter,
                                               TfLiteTensor* output,
                                               double* multiplier);
 

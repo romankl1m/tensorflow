@@ -171,6 +171,9 @@ class XlaDevice : public LocalDevice {
   void SetAllowsSyncOnCompletion(bool sync_on_completion) LOCKS_EXCLUDED(mu_);
   bool AllowsSyncOnCompletion() const override LOCKS_EXCLUDED(mu_);
 
+  // Installs an error handling callback when RefreshStatus sees !status.ok().
+  void SetHandleDeviceErrorCallback(std::function<Status()> callback);
+
   Status RefreshStatus() override LOCKS_EXCLUDED(mu_);
 
  private:
@@ -187,6 +190,9 @@ class XlaDevice : public LocalDevice {
   static Status GetMetadataFromDevice(DeviceBase* device,
                                       const XlaDevice::Metadata** metadata);
 
+  // Handles error when RefreshStatus sees !status.ok().
+  Status HandleDeviceError();
+
   mutable mutex mu_;
   // The metadata of this XlaDevice.
   const Metadata xla_metadata_;
@@ -196,6 +202,8 @@ class XlaDevice : public LocalDevice {
   const DeviceType jit_device_name_;
   // The platform for this device.
   se::Platform* const platform_;  // Not owned.
+  // Intra-op threads to spawn (from SessionOptions).
+  const int intra_op_parallelism_threads_;
   // Memory allocator associated with this device.
   Allocator* xla_allocator_ GUARDED_BY(mu_) = nullptr;  // Not owned.
 
@@ -206,14 +214,12 @@ class XlaDevice : public LocalDevice {
   std::shared_ptr<se::Stream> stream_ GUARDED_BY(mu_);
   // If false, only stream_ is valid and all computation and transfers use
   // stream_. If true, computation is performed by stream_ and transfers are
-  // performed by host_to_device/device_to_host_stream.
+  // performed by host_to_device/device_to_device stream or borrowing a stream
+  // for each device to host transfer.
   const bool use_multiple_streams_;
   // If use_multiple_streams_, host to device transfers are performed using this
   // stream.
   std::shared_ptr<se::Stream> host_to_device_stream_ GUARDED_BY(mu_);
-  // If use_multiple_streams_, device to host transfers are performed using this
-  // stream.
-  std::shared_ptr<se::Stream> device_to_host_stream_ GUARDED_BY(mu_);
   // If use_multiple_streams_, transfers between different devices are performed
   // using these streams.
   std::vector<std::shared_ptr<se::Stream>> device_to_device_streams_
@@ -236,6 +242,9 @@ class XlaDevice : public LocalDevice {
   // True if the device allows XlaDevice::Sync to be called on completion
   // regardless of status.
   bool sync_on_completion_ GUARDED_BY(mu_) = true;
+
+  // A callback that will be invoked when RefreshStatus sees a status error.
+  std::function<Status()> device_error_callback_ GUARDED_BY(mu_);
 
   // Set of devices to use. This controls which of the devices on the given
   // platform will have resources allocated. For GPUs this will be

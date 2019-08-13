@@ -213,8 +213,8 @@ class BuildDenseInequalitySplitsOp : public OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output("split_infos",
                                                      TensorShape({size_output}),
                                                      &output_splits_t));
-    tensorflow::TTypes<string>::Vec output_splits =
-        output_splits_t->vec<string>();
+    tensorflow::TTypes<tstring>::Vec output_splits =
+        output_splits_t->vec<tstring>();
 
     if (num_elements == 0) {
       return;
@@ -529,8 +529,8 @@ class BuildSparseInequalitySplitsOp : public OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output(
                                 "split_infos", TensorShape({num_elements}),
                                 &output_splits_t));
-    tensorflow::TTypes<string>::Vec output_splits =
-        output_splits_t->vec<string>();
+    tensorflow::TTypes<tstring>::Vec output_splits =
+        output_splits_t->vec<tstring>();
     SplitBuilderState state(context);
     // For each tree node that needs to be split.
     for (int root_idx = 0; root_idx < num_elements; ++root_idx) {
@@ -538,7 +538,6 @@ class BuildSparseInequalitySplitsOp : public OpKernel {
           partition_boundaries[non_empty_partitions[root_idx]];
 
       float best_gain = std::numeric_limits<float>::lowest();
-      int32 best_dimension_idx = 0;
       bool default_right = false;
       int32 best_element_idx = 0;
 
@@ -571,7 +570,6 @@ class BuildSparseInequalitySplitsOp : public OpKernel {
       // Iterate through dimensions.
       for (int j = 0; j < dimension_boundaries.size() - 1; ++j) {
         const DimensionBoundary& dimension_and_start = dimension_boundaries[j];
-        const int32 dimension_id = dimension_and_start.dimension_id;
 
         int start_index = dimension_and_start.start_index;
         // Even for the last dimension, we always have additional dummy
@@ -630,7 +628,6 @@ class BuildSparseInequalitySplitsOp : public OpKernel {
               best_right_node_stats = right_stats_default_left;
               best_element_idx = element_idx;
               default_right = false;
-              best_dimension_idx = dimension_id;
             }
           }
           // Consider calculating the default direction only when there were
@@ -648,7 +645,6 @@ class BuildSparseInequalitySplitsOp : public OpKernel {
               best_right_node_stats = right_stats_default_right;
               best_element_idx = element_idx;
               default_right = true;
-              best_dimension_idx = dimension_id;
             }
           }
         }
@@ -784,8 +780,8 @@ class BuildCategoricalEqualitySplitsOp : public OpKernel {
     OP_REQUIRES_OK(context, context->allocate_output("split_infos",
                                                      TensorShape({size_output}),
                                                      &output_splits_t));
-    tensorflow::TTypes<string>::Vec output_splits =
-        output_splits_t->vec<string>();
+    tensorflow::TTypes<tstring>::Vec output_splits =
+        output_splits_t->vec<tstring>();
     if (num_elements == 0) {
       return;
     }

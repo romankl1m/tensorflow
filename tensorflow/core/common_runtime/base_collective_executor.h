@@ -58,7 +58,8 @@ class CollectiveAdapter {
 
   // Generate a scalar tensor of same DataType and on the same device
   // as the backing tensor.
-  virtual Tensor Scalar(Allocator* a) const = 0;
+  virtual Tensor Scalar(Allocator* a,
+                        const AllocationAttributes& attr) const = 0;
 
   // Debugging string describing buffer location
   virtual string TBounds(const Tensor& t) const = 0;
@@ -78,9 +79,15 @@ class CollectiveAdapter {
 };
 
 // Create a CollectiveAdaptor wrapping 'output', specialized to its
-// data-type and shape.
+// data-type and shape.  If align_chunks == true then chunk size may
+// be larger than output->NumElements() / num_chunks and one or more
+// of the suffix chunks may be empty.  Chunks will be arranged to start
+// and end on alignment boundaries.  If align_chunks == false then
+// output->NumElements() % num_chunks must be 0 and all chunks will
+// have exactly the same size, ignoring alignment issues.
 CollectiveAdapter* MakeCollectiveAdapter(Tensor* output, int num_chunks,
-                                         Allocator* allocator);
+                                         Allocator* allocator,
+                                         bool align_chunks = true);
 
 // Default implementation of CollectiveExecutor.  Delegates the actual
 // work of moving data to a class specialized for the operation type,
@@ -133,6 +140,10 @@ class BaseCollectiveExecutor : public CollectiveExecutor {
     remote_access_->PostToPeer(peer_device, peer_task, key, from_device,
                                from_device_ctx, from_alloc_attr, from_tensor,
                                client_locality, done);
+  }
+
+  void RunClosure(std::function<void()> closure) override {
+    remote_access_->RunClosure(std::move(closure));
   }
 
   // If we need to enforce an ordering on any portion of collective

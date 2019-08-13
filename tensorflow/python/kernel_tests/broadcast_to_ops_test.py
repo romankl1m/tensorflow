@@ -19,8 +19,10 @@ from __future__ import print_function
 
 import numpy as np
 
+from tensorflow.python.eager import context
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import errors
 from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gradient_checker
@@ -77,6 +79,26 @@ class BroadcastToTest(test_util.TensorFlowTestCase):
       self.assertAllEqual(v_tf.eval(), v_np)
 
   @test_util.run_deprecated_v1
+  def testBroadcastToShapeLargerDim(self):
+    input_shape = [2, 1, 3, 2, 2, 2]
+    output_shape = [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 15, 3, 2, 2, 2]
+    with self.cached_session(use_gpu=True):
+      x = np.array(np.random.randint(5, size=input_shape), dtype=np.int32)
+      v_tf = array_ops.broadcast_to(constant_op.constant(x), output_shape)
+      v_np = np.broadcast_to(x, output_shape)
+      self.assertAllEqual(v_tf.eval(), v_np)
+
+  @test_util.run_deprecated_v1
+  def testBroadcastToShapeLargerDim2(self):
+    input_shape = [2, 1, 3, 2, 2, 2, 1, 1, 1]
+    output_shape = [1, 1, 1, 2, 5, 3, 2, 2, 2, 3, 3, 3]
+    with self.cached_session(use_gpu=True):
+      x = np.array(np.random.randint(5, size=input_shape), dtype=np.int32)
+      v_tf = array_ops.broadcast_to(constant_op.constant(x), output_shape)
+      v_np = np.broadcast_to(x, output_shape)
+      self.assertAllEqual(v_tf.eval(), v_np)
+
+  @test_util.run_deprecated_v1
   def testBroadcastToScalar(self):
     with self.session(use_gpu=True):
       x = np.array(1, dtype=np.int32)
@@ -88,8 +110,9 @@ class BroadcastToTest(test_util.TensorFlowTestCase):
   def testBroadcastScalarToNonScalar(self):
     with self.session(use_gpu=True):
       x = np.array(1.0, dtype=np.float)
-      v_tf = array_ops.broadcast_to(constant_op.constant(1.0), [2, 3, 4])
-      v_np = np.broadcast_to(x, [2, 3, 4])
+      v_tf = array_ops.broadcast_to(constant_op.constant(1.0), [2, 3, 4,
+                                                                1, 1, 1])
+      v_np = np.broadcast_to(x, [2, 3, 4, 1, 1, 1])
       self.assertAllEqual(v_tf.eval(), v_np)
 
   @test_util.run_deprecated_v1
@@ -105,6 +128,14 @@ class BroadcastToTest(test_util.TensorFlowTestCase):
         self.assertAllEqual(v_tf.eval(), v_np)
         # check shape inference when shape input is constant
         self.assertAllEqual(shape, v_np.shape)
+
+  def testBroadcastToBadOutputShape(self):
+    with context.eager_mode():
+      with self.assertRaisesRegexp(errors.InvalidArgumentError,
+                                   "Unable to broadcast tensor of shape"):
+        self.evaluate(
+            array_ops.broadcast_to(
+                constant_op.constant([0, 1]), constant_op.constant([2, 1])))
 
   @test_util.run_deprecated_v1
   def testGradientForScalar(self):
@@ -148,6 +179,18 @@ class BroadcastToTest(test_util.TensorFlowTestCase):
                                                     out, out.get_shape())
     self.assertLess(err, 1e-4)
 
+  @test_util.run_deprecated_v1
+  def testGradientWithLargeDim(self):
+    input_shape = [2, 1, 3, 2, 2, 2, 1, 1, 1]
+    output_shape = [1, 1, 1, 2, 5, 3, 2, 2, 2, 3, 3, 3]
+    x = constant_op.constant(np.array(np.random.randn(*input_shape),
+                                      dtype=np.float32))
+    v = array_ops.broadcast_to(x, output_shape)
+    out = 2 * v
+    with self.cached_session():
+      err = gradient_checker.compute_gradient_error(x, x.get_shape(),
+                                                    out, out.get_shape())
+    self.assertLess(err, 1e-4)
 
 if __name__ == "__main__":
   test_lib.main()
